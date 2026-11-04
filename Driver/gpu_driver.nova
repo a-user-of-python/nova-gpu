@@ -1,0 +1,708 @@
+; gpu_driver.nova — NovaCPU driver for the NovaGPU, speaking NovaBus.
+;
+; This guest program is the compatibility proof: the REAL NovaCPU runs
+; it, and every GPU interaction goes through the bus — MMIO registers
+; at 0xFFFF_FFFF_FFFF_0100.. and 64-byte command descriptors in a ring
+; in guest RAM. The vertex buffer is deliberately never uploaded: the
+; DRAW carries the NEED_ASSET flag, the GPU suspends it and requests
+; service, and this driver copies its built-in cube table into the
+; staging area and ACKs. After PRESENT + DOWNLOAD the driver sums the
+; framebuffer bytes and prints the checksum plus "GPU OK".
+;
+; Guest RAM layout:
+;   0x20000  command ring (64 slots x 64 B)
+;   0x21000  GPU request page
+;   0x22000  loader header: u64 vertex-shader len, u64 fragment len
+;   0x22010  vertex shader binary (loader-provided)
+;   0x22800  fragment shader binary (loader-provided)
+;   0x23000  cube index buffer, 144 bytes (loader-provided)
+;   0x24000  driver cells (see below)
+;   0x25000  decimal-print digit buffer
+;   0x30000  ASSET staging area (1152 bytes)
+;   0x100000 framebuffer readback (256*192*4 = 196608 bytes)
+;
+; Cells (0x24000 +): +0 TAIL, +8 SLOTN, +16 FBH, +24 VBH, +32 IBH,
+;   +40 SHH, +48 REQSEQ, +56 DESCADDR, +64 PTRC, +72 VSLEN, +80 FSLEN,
+;   +88 (free), +96 (free), +104 DIGPTR, +112 DECVAL, +120 CSUM, +128 CIDX
+
+main:
+    ; ---- bus setup: RING_BASE, RING_SLOTS=64, REQ_PAGE ----
+    PUSH64 0x20000
+    PUSH64 0xFFFFFFFFFFFF0118
+    STORE64
+    PUSH8 64
+    PUSH64 0xFFFFFFFFFFFF0120
+    STORE64
+    PUSH64 0x21000
+    PUSH64 0xFFFFFFFFFFFF0140
+    STORE64
+    ; ---- shader lengths from the loader header ----
+    PUSH64 0x22000
+    LOAD64
+    PUSH64 0x24048
+    STORE64
+    PUSH64 0x22008
+    LOAD64
+    PUSH64 0x24050
+    STORE64
+
+    ; ---- ALLOC framebuffer (196608) -> FBH ----
+    PUSH64 1
+    PUSH64 196608
+    PUSH8 0
+    PUSH8 0
+    PUSH8 0
+    PUSH8 0
+    CALL SUBMIT
+    PUSH64 0x24038
+    LOAD64
+    PUSH8 16
+    ADD
+    LOAD64
+    PUSH64 0x24010
+    STORE64
+    ; ---- ALLOC vertex buffer (1152) -> VBH ----
+    PUSH64 1
+    PUSH64 1152
+    PUSH8 0
+    PUSH8 0
+    PUSH8 0
+    PUSH8 0
+    CALL SUBMIT
+    PUSH64 0x24038
+    LOAD64
+    PUSH8 16
+    ADD
+    LOAD64
+    PUSH64 0x24018
+    STORE64
+    ; ---- ALLOC index buffer (144) -> IBH ----
+    PUSH64 1
+    PUSH64 144
+    PUSH8 0
+    PUSH8 0
+    PUSH8 0
+    PUSH8 0
+    CALL SUBMIT
+    PUSH64 0x24038
+    LOAD64
+    PUSH8 16
+    ADD
+    LOAD64
+    PUSH64 0x24020
+    STORE64
+    ; ---- ALLOC shader buffer (8192) -> SHH ----
+    PUSH64 1
+    PUSH64 8192
+    PUSH8 0
+    PUSH8 0
+    PUSH8 0
+    PUSH8 0
+    CALL SUBMIT
+    PUSH64 0x24038
+    LOAD64
+    PUSH8 16
+    ADD
+    LOAD64
+    PUSH64 0x24028
+    STORE64
+
+    ; ---- UPLOAD shaders: guest 0x22010, len 0x7F0 + FSLEN ----
+    PUSH64 3
+    PUSH64 0x24028
+    LOAD64
+    PUSH8 0
+    PUSH64 0x22010
+    PUSH64 0x24050
+    LOAD64
+    PUSH64 0x7F0
+    ADD
+    PUSH8 0
+    CALL SUBMIT
+    ; ---- SET_VSHADER (SHH, 0, VSLEN) ----
+    PUSH64 6
+    PUSH64 0x24028
+    LOAD64
+    PUSH8 0
+    PUSH64 0x24048
+    LOAD64
+    PUSH8 0
+    PUSH8 0
+    CALL SUBMIT
+    ; ---- SET_FSHADER (SHH, 0x7F0, FSLEN) ----
+    PUSH64 7
+    PUSH64 0x24028
+    LOAD64
+    PUSH64 0x7F0
+    PUSH64 0x24050
+    LOAD64
+    PUSH8 0
+    PUSH8 0
+    CALL SUBMIT
+    ; ---- UPLOAD indices: guest 0x23000 -> IBH, 144 bytes ----
+    PUSH64 3
+    PUSH64 0x24020
+    LOAD64
+    PUSH8 0
+    PUSH64 0x23000
+    PUSH64 144
+    PUSH8 0
+    CALL SUBMIT
+    ; ---- SET_FBUF (FBH, 256, 192) ----
+    PUSH64 12
+    PUSH64 0x24010
+    LOAD64
+    PUSH64 256
+    PUSH64 192
+    PUSH8 0
+    PUSH8 0
+    CALL SUBMIT
+    ; ---- SET_VBUF (VBH) ----
+    PUSH64 10
+    PUSH64 0x24018
+    LOAD64
+    PUSH8 0
+    PUSH8 0
+    PUSH8 0
+    PUSH8 0
+    CALL SUBMIT
+    ; ---- SET_IBUF (IBH) ----
+    PUSH64 11
+    PUSH64 0x24020
+    LOAD64
+    PUSH8 0
+    PUSH8 0
+    PUSH8 0
+    PUSH8 0
+    CALL SUBMIT
+
+    ; ---- SET_UNIFORM c0 = (0.8, 0, 0, 0) ----
+    PUSH64 9
+    PUSH8 0
+    PUSH32 0x3F4CCCCD
+    PUSH8 0
+    PUSH8 0
+    PUSH8 0
+    CALL SUBMIT
+    ; ---- c1 = (0, 0.8, 0, 0) ----
+    PUSH64 9
+    PUSH8 1
+    PUSH8 0
+    PUSH32 0x3F4CCCCD
+    PUSH8 0
+    PUSH8 0
+    CALL SUBMIT
+    ; ---- c2 = (0, 0, 0.5, 0.5) ----
+    PUSH64 9
+    PUSH8 2
+    PUSH8 0
+    PUSH8 0
+    PUSH32 0x3F000000
+    PUSH32 0x3F000000
+    CALL SUBMIT
+    ; ---- c3 = (0, 0, 0, 1) ----
+    PUSH64 9
+    PUSH8 3
+    PUSH8 0
+    PUSH8 0
+    PUSH8 0
+    PUSH32 0x3F800000
+    CALL SUBMIT
+    ; ---- c4 = mask x ----
+    PUSH64 9
+    PUSH8 4
+    PUSH32 0x3F800000
+    PUSH8 0
+    PUSH8 0
+    PUSH8 0
+    CALL SUBMIT
+    ; ---- c5 = mask y ----
+    PUSH64 9
+    PUSH8 5
+    PUSH8 0
+    PUSH32 0x3F800000
+    PUSH8 0
+    PUSH8 0
+    CALL SUBMIT
+    ; ---- c6 = mask z ----
+    PUSH64 9
+    PUSH8 6
+    PUSH8 0
+    PUSH8 0
+    PUSH32 0x3F800000
+    PUSH8 0
+    CALL SUBMIT
+    ; ---- c7 = mask w ----
+    PUSH64 9
+    PUSH8 7
+    PUSH8 0
+    PUSH8 0
+    PUSH8 0
+    PUSH32 0x3F800000
+    CALL SUBMIT
+    ; ---- c8 = light (0.5, 1.0, 0.25, 0) ----
+    PUSH64 9
+    PUSH8 8
+    PUSH32 0x3F000000
+    PUSH32 0x3F800000
+    PUSH32 0x3E800000
+    PUSH8 0
+    CALL SUBMIT
+    ; ---- c9 = ones ----
+    PUSH64 9
+    PUSH8 9
+    PUSH32 0x3F800000
+    PUSH32 0x3F800000
+    PUSH32 0x3F800000
+    PUSH32 0x3F800000
+    CALL SUBMIT
+
+    ; ---- CLEAR 0xFF200810 (PUSH32 immediates are signed: -14678000
+    ;      has exactly those low 32 bits; the device masks to 32) ----
+    PUSH64 14
+    PUSH32 -14678000
+    PUSH8 0
+    PUSH8 0
+    PUSH8 0
+    PUSH8 0
+    CALL SUBMIT
+    ; ---- DRAW 36 indices, NEED_ASSET, staging 0x30000, len 1152, target VBH ----
+    PUSH64 15
+    PUSH8 36
+    PUSH8 1
+    PUSH64 0x30000
+    PUSH64 1152
+    PUSH64 0x24018
+    LOAD64
+    CALL SUBMIT
+    ; ---- PRESENT (FBH) ----
+    PUSH64 18
+    PUSH64 0x24010
+    LOAD64
+    PUSH8 0
+    PUSH8 0
+    PUSH8 0
+    PUSH8 0
+    CALL SUBMIT
+    ; ---- DOWNLOAD framebuffer -> guest 0x100000 ----
+    PUSH64 4
+    PUSH64 0x24010
+    LOAD64
+    PUSH8 0
+    PUSH64 0x100000
+    PUSH64 196608
+    PUSH8 0
+    CALL SUBMIT
+
+    ; ---- checksum the readback ----
+cs_loop:
+    PUSH64 0x100000
+    PUSH64 0x24080
+    LOAD64
+    ADD
+    LOADU8
+    PUSH64 0x24078
+    LOAD64
+    ADD
+    PUSH64 0x24078
+    STORE64
+    PUSH64 0x24080
+    LOAD64
+    INC
+    DUP
+    PUSH64 0x24080
+    STORE64
+    PUSH64 196608
+    EQ
+    BNZ cs_done
+    JMP cs_loop
+cs_done:
+    PUSH64 STR_FB
+    CALL PRINTSTR
+    PUSH64 0x24078
+    LOAD64
+    CALL PRINTDEC
+    PUSH64 STR_NL
+    CALL PRINTSTR
+    PUSH64 STR_OK
+    CALL PRINTSTR
+    WFI
+
+; ------------------------------------------------------------------
+; SUBMIT — stack in: OP A0 A1 A2 A3 A4 (A4 on top). Writes the
+; descriptor into the next ring slot, rings the doorbell, and waits
+; for completion, servicing GPU requests while waiting.
+; ------------------------------------------------------------------
+SUBMIT:
+    PUSH64 0x24008
+    LOAD64
+    PUSH8 6
+    SHL
+    PUSH64 0x20000
+    ADD
+    PUSH64 0x24038
+    STORE64
+    PUSH64 0x24008
+    LOAD64
+    INC
+    PUSH64 0x24008
+    STORE64
+    ; A4 -> word6 (desc+48)
+    PUSH64 0x24038
+    LOAD64
+    PUSH8 48
+    ADD
+    STORE64
+    ; A3 -> word5 (desc+40)
+    PUSH64 0x24038
+    LOAD64
+    PUSH8 40
+    ADD
+    STORE64
+    ; A2 -> word4 (desc+32)
+    PUSH64 0x24038
+    LOAD64
+    PUSH8 32
+    ADD
+    STORE64
+    ; A1 -> word3 (desc+24)
+    PUSH64 0x24038
+    LOAD64
+    PUSH8 24
+    ADD
+    STORE64
+    ; A0 -> word2 (desc+16)
+    PUSH64 0x24038
+    LOAD64
+    PUSH8 16
+    ADD
+    STORE64
+    ; OP -> word0 (desc+0)
+    PUSH64 0x24038
+    LOAD64
+    STORE64
+    ; fence word1 = 0
+    PUSH8 0
+    PUSH64 0x24038
+    LOAD64
+    PUSH8 8
+    ADD
+    STORE64
+    ; status word7 = 0
+    PUSH8 0
+    PUSH64 0x24038
+    LOAD64
+    PUSH8 56
+    ADD
+    STORE64
+    ; doorbell: TAIL++ and write it
+    PUSH64 0x24000
+    LOAD64
+    INC
+    DUP
+    PUSH64 0x24000
+    STORE64
+    PUSH64 0xFFFFFFFFFFFF0128
+    STORE64
+sub_wait:
+    PUSH64 0x24038
+    LOAD64
+    PUSH8 56
+    ADD
+    LOAD64
+    DUP
+    PUSH8 1
+    EQ
+    BNZ sub_done
+    DUP
+    PUSH8 2
+    EQ
+    BNZ sub_service
+    DUP
+    PUSH64 0xFFFFFFFFFFFFFFFF
+    EQ
+    BNZ sub_error
+    POP
+    JMP sub_wait
+sub_service:
+    POP
+    CALL SERVICE
+    JMP sub_wait
+sub_error:
+    POP
+    PUSH64 STR_ERR
+    CALL PRINTSTR
+    WFI
+sub_done:
+    POP
+    RET
+
+; ------------------------------------------------------------------
+; SERVICE — the GPU asked for the cube asset: copy CUBETABLE into the
+; staging area and write REQ_ACK with the request's sequence number.
+; ------------------------------------------------------------------
+SERVICE:
+    PUSH64 0x21000
+    LOAD64
+    PUSH64 0x24030
+    STORE64
+    PUSH64 1152
+    PUSH64 0x30000
+    PUSH64 CUBETABLE
+    MEMCPY
+    PUSH64 0x24030
+    LOAD64
+    PUSH64 0xFFFFFFFFFFFF0148
+    STORE64
+    RET
+
+; ------------------------------------------------------------------
+; PRINTSTR — stack in: address of a NUL-terminated string.
+; ------------------------------------------------------------------
+PRINTSTR:
+    PUSH64 0x24040
+    STORE64
+ps_loop:
+    PUSH64 0x24040
+    LOAD64
+    LOADU8
+    DUP
+    PUSH8 0
+    EQ
+    BNZ ps_done
+    PUSH64 0xFFFFFFFFFFFF0000
+    STORE8
+    PUSH64 0x24040
+    LOAD64
+    INC
+    PUSH64 0x24040
+    STORE64
+    JMP ps_loop
+ps_done:
+    POP
+    RET
+
+; ------------------------------------------------------------------
+; PRINTDEC — stack in: unsigned value; prints it in decimal.
+; ------------------------------------------------------------------
+PRINTDEC:
+    PUSH64 0x24070
+    STORE64
+    PUSH64 0x25000
+    PUSH64 0x24068
+    STORE64
+pd_loop:
+    PUSH64 0x24070
+    LOAD64
+    PUSH8 0
+    EQ
+    BNZ pd_check
+    PUSH64 0x24070
+    LOAD64
+    PUSH8 10
+    REM
+    PUSH8 48
+    ADD
+    PUSH64 0x24068
+    LOAD64
+    STORE8
+    PUSH64 0x24068
+    LOAD64
+    INC
+    PUSH64 0x24068
+    STORE64
+    PUSH64 0x24070
+    LOAD64
+    PUSH8 10
+    DIV
+    PUSH64 0x24070
+    STORE64
+    JMP pd_loop
+pd_check:
+    PUSH64 0x24068
+    LOAD64
+    PUSH64 0x25000
+    EQ
+    BZ pd_emit
+    PUSH8 48
+    PUSH64 0xFFFFFFFFFFFF0000
+    STORE8
+    RET
+pd_emit:
+pd_emit_loop:
+    PUSH64 0x24068
+    LOAD64
+    DEC
+    DUP
+    PUSH64 0x24068
+    STORE64
+    LOADU8
+    PUSH64 0xFFFFFFFFFFFF0000
+    STORE8
+    PUSH64 0x25000
+    PUSH64 0x24068
+    LOAD64
+    LT
+    BNZ pd_emit_loop
+    RET
+
+; ------------------------------------------------------------------
+; Data
+; ------------------------------------------------------------------
+STR_FB:
+    .word 0x0000204246555047
+STR_NL:
+    .word 0x000000000000000A
+STR_OK:
+    .word 0x000A4B4F20555047
+STR_ERR:
+    .word 0x0A52524520555047
+    .word 0x0000000000000000
+
+; Cube vertex table: 24 vertices x 12 floats (NVF1), two floats per
+; word, little-endian — identical data to NovaGPUStandard.proofCube().
+CUBETABLE:
+    .word 0xBF1EB852BF1EB852
+    .word 0x000000003F1EB852
+    .word 0x3F80000000000000
+    .word 0x0000000000000000
+    .word 0x3E8000003F800000
+    .word 0x3F8000003E4CCCCD
+    .word 0xBF1EB8523F1EB852
+    .word 0x000000003F1EB852
+    .word 0x3F80000000000000
+    .word 0x000000003F800000
+    .word 0x3E8000003F800000
+    .word 0x3F8000003E4CCCCD
+    .word 0x3F1EB8523F1EB852
+    .word 0x000000003F1EB852
+    .word 0x3F80000000000000
+    .word 0x3F80000000000000
+    .word 0x3E8000003F800000
+    .word 0x3F8000003E4CCCCD
+    .word 0x3F1EB852BF1EB852
+    .word 0x000000003F1EB852
+    .word 0x3F80000000000000
+    .word 0x3F8000003F800000
+    .word 0x3E8000003F800000
+    .word 0x3F8000003E4CCCCD
+    .word 0xBF1EB8523F1EB852
+    .word 0x00000000BF1EB852
+    .word 0xBF80000000000000
+    .word 0x0000000000000000
+    .word 0x3F8000003E4CCCCD
+    .word 0x3F8000003EB33333
+    .word 0xBF1EB852BF1EB852
+    .word 0x00000000BF1EB852
+    .word 0xBF80000000000000
+    .word 0x000000003F800000
+    .word 0x3F8000003E4CCCCD
+    .word 0x3F8000003EB33333
+    .word 0x3F1EB852BF1EB852
+    .word 0x00000000BF1EB852
+    .word 0xBF80000000000000
+    .word 0x3F80000000000000
+    .word 0x3F8000003E4CCCCD
+    .word 0x3F8000003EB33333
+    .word 0x3F1EB8523F1EB852
+    .word 0x00000000BF1EB852
+    .word 0xBF80000000000000
+    .word 0x3F8000003F800000
+    .word 0x3F8000003E4CCCCD
+    .word 0x3F8000003EB33333
+    .word 0xBF1EB8523F1EB852
+    .word 0x3F8000003F1EB852
+    .word 0x0000000000000000
+    .word 0x0000000000000000
+    .word 0x3EE666663E800000
+    .word 0x3F8000003F800000
+    .word 0xBF1EB8523F1EB852
+    .word 0x3F800000BF1EB852
+    .word 0x0000000000000000
+    .word 0x000000003F800000
+    .word 0x3EE666663E800000
+    .word 0x3F8000003F800000
+    .word 0x3F1EB8523F1EB852
+    .word 0x3F800000BF1EB852
+    .word 0x0000000000000000
+    .word 0x3F80000000000000
+    .word 0x3EE666663E800000
+    .word 0x3F8000003F800000
+    .word 0x3F1EB8523F1EB852
+    .word 0x3F8000003F1EB852
+    .word 0x0000000000000000
+    .word 0x3F8000003F800000
+    .word 0x3EE666663E800000
+    .word 0x3F8000003F800000
+    .word 0xBF1EB852BF1EB852
+    .word 0xBF800000BF1EB852
+    .word 0x0000000000000000
+    .word 0x0000000000000000
+    .word 0x3F59999A3F800000
+    .word 0x3F8000003E800000
+    .word 0xBF1EB852BF1EB852
+    .word 0xBF8000003F1EB852
+    .word 0x0000000000000000
+    .word 0x000000003F800000
+    .word 0x3F59999A3F800000
+    .word 0x3F8000003E800000
+    .word 0x3F1EB8523F1EB852
+    .word 0x3F800000BF1EB852
+    .word 0x0000000000000000
+    .word 0x3F80000000000000
+    .word 0x3F59999A3F800000
+    .word 0x3F8000003E800000
+    .word 0x3F1EB852BF1EB852
+    .word 0xBF800000BF1EB852
+    .word 0x0000000000000000
+    .word 0x3F8000003F800000
+    .word 0x3F59999A3F800000
+    .word 0x3F8000003E800000
+    .word 0x3F1EB852BF1EB852
+    .word 0x000000003F1EB852
+    .word 0x000000003F800000
+    .word 0x0000000000000000
+    .word 0x3EB333333F666666
+    .word 0x3F8000003F800000
+    .word 0x3F1EB8523F1EB852
+    .word 0x000000003F1EB852
+    .word 0x000000003F800000
+    .word 0x000000003F800000
+    .word 0x3EB333333F666666
+    .word 0x3F8000003F800000
+    .word 0x3F1EB8523F1EB852
+    .word 0x00000000BF1EB852
+    .word 0x000000003F800000
+    .word 0x3F80000000000000
+    .word 0x3EB333333F666666
+    .word 0x3F8000003F800000
+    .word 0x3F1EB852BF1EB852
+    .word 0x00000000BF1EB852
+    .word 0x000000003F800000
+    .word 0x3F8000003F800000
+    .word 0x3EB333333F666666
+    .word 0x3F8000003F800000
+    .word 0xBF1EB852BF1EB852
+    .word 0x00000000BF1EB852
+    .word 0x00000000BF800000
+    .word 0x0000000000000000
+    .word 0x3F7333333E99999A
+    .word 0x3F8000003F733333
+    .word 0xBF1EB8523F1EB852
+    .word 0x00000000BF1EB852
+    .word 0x00000000BF800000
+    .word 0x000000003F800000
+    .word 0x3F7333333E99999A
+    .word 0x3F8000003F733333
+    .word 0xBF1EB8523F1EB852
+    .word 0x000000003F1EB852
+    .word 0x00000000BF800000
+    .word 0x3F80000000000000
+    .word 0x3F7333333E99999A
+    .word 0x3F8000003F733333
+    .word 0xBF1EB852BF1EB852
+    .word 0x000000003F1EB852
+    .word 0x00000000BF800000
+    .word 0x3F8000003F800000
+    .word 0x3F7333333E99999A
+    .word 0x3F8000003F733333

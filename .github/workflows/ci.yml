@@ -1,0 +1,80 @@
+name: ci
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  host-tests:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assemble the Nova assembly GPU driver
+        run: |
+          python3 Driver/novas.py Driver/gpu_driver.nova -o Driver/gpu_driver.bin
+          ls -l Driver/gpu_driver.bin
+      - name: Build bus host tests
+        run: |
+          mkdir -p build
+          swiftc -O -o build/hosttests \
+            HostTests/main.swift \
+            App/NovaGPUTest/NovaMemory.swift \
+            Sources/NovaGPU/NovaGPUShader.swift \
+            Sources/NovaGPU/NovaGPU.swift \
+            Sources/NovaGPU/NovaBus.swift \
+            Sources/NovaGPU/NovaBusClient.swift \
+            Sources/NovaGPU/NovaGPUStandard.swift
+      - name: Run bus host tests
+        run: |
+          set -o pipefail
+          ./build/hosttests | tee build/hosttests.log
+      - name: Build CPU proof (real NovaCPU core + driver)
+        run: |
+          swiftc -O -o build/proof \
+            ProofTests/main.swift \
+            App/NovaGPUTest/NovaCPU.swift \
+            App/NovaGPUTest/NovaMemory.swift \
+            App/NovaGPUTest/NovaJIT.swift \
+            Sources/NovaGPU/NovaGPUShader.swift \
+            Sources/NovaGPU/NovaGPU.swift \
+            Sources/NovaGPU/NovaBus.swift \
+            Sources/NovaGPU/NovaBusClient.swift \
+            Sources/NovaGPU/NovaGPUStandard.swift
+      - name: Run CPU proof
+        run: |
+          set -o pipefail
+          ./build/proof Driver/gpu_driver.bin | tee build/proof.log
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: build/*.log
+
+  build-ipa:
+    runs-on: macos-26
+    needs: host-tests
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assemble driver into the app bundle resources
+        run: python3 Driver/novas.py Driver/gpu_driver.nova -o App/NovaGPUTest/gpu_driver.bin
+      - name: Build the app (unsigned)
+        run: |
+          set -o pipefail
+          mkdir -p build
+          xcodebuild -project App/NovaGPUTest.xcodeproj -scheme NovaGPUTest \
+            -configuration Release -sdk iphoneos \
+            -derivedDataPath build/dd \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            build | tee build/xcodebuild.log
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p Payload
+          cp -r build/dd/Build/Products/Release-iphoneos/NovaGPUTest.app Payload/
+          zip -qry NovaGPU-Test-unsigned.ipa Payload
+          ls -l NovaGPU-Test-unsigned.ipa
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: NovaGPU-Test-ipa
+          path: NovaGPU-Test-unsigned.ipa
