@@ -759,7 +759,11 @@ final class NovaGPU {
         }
         var work: [WorkTri] = []
         work.reserveCapacity(idxCount / 3)
-        for box in boxes { work.append(contentsOf: box.tris) }
+        var workStarts: [Int] = [0]
+        for box in boxes {
+            work.append(contentsOf: box.tris)
+            workStarts.append(work.count)
+        }
         stats.trianglesOut += UInt64(work.count)
 
         // ---- Rasterise in horizontal row chunks over the clusters.
@@ -781,14 +785,27 @@ final class NovaGPU {
         let fb = framebuffer
         let chunkRows = 4
         let chunkCount = (height + chunkRows - 1) / chunkRows
+        // Binning fans out over the same ranges (per-range bin
+        // lists merged in range order keep every chunk's triangle
+        // order identical to the serial build).
+        final class BinBox { var bins: [[Int]] = [] }
+        let binBoxes = (0..<rangeCount).map { _ in BinBox() }
+        DispatchQueue.concurrentPerform(iterations: rangeCount) { range in
+            var local: [[Int]] = [[Int]](repeating: [], count: chunkCount)
+            for wi in workStarts[range]..<workStarts[range + 1] {
+                let wt = work[wi]
+                var ry0 = Int(floorf(min(wt.s0.1, min(wt.s1.1, wt.s2.1))))
+                var ry1 = Int(ceilf(max(wt.s0.1, max(wt.s1.1, wt.s2.1))))
+                if ry0 < 0 { ry0 = 0 }
+                if ry1 > height - 1 { ry1 = height - 1 }
+                if ry0 > ry1 { continue }
+                for c in (ry0 / chunkRows)...(ry1 / chunkRows) { local[c].append(wi) }
+            }
+            binBoxes[range].bins = local
+        }
         var bins: [[Int]] = [[Int]](repeating: [], count: chunkCount)
-        for (wi, wt) in work.enumerated() {
-            var ry0 = Int(floorf(min(wt.s0.1, min(wt.s1.1, wt.s2.1))))
-            var ry1 = Int(ceilf(max(wt.s0.1, max(wt.s1.1, wt.s2.1))))
-            if ry0 < 0 { ry0 = 0 }
-            if ry1 > height - 1 { ry1 = height - 1 }
-            if ry0 > ry1 { continue }
-            for c in (ry0 / chunkRows)...(ry1 / chunkRows) { bins[c].append(wi) }
+        for box in binBoxes {
+            for c in 0..<chunkCount { bins[c].append(contentsOf: box.bins[c]) }
         }
         let chunkOps = UnsafeMutablePointer<UInt64>.allocate(capacity: chunkCount)
         let chunkFrags = UnsafeMutablePointer<UInt64>.allocate(capacity: chunkCount)
