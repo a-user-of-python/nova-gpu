@@ -174,7 +174,70 @@ struct WarpContext {
     }
 }
 
+// MARK: - Decoded program (speed-round fast path)
+//
+// A shader program decoded ONCE into flat operand arrays, so a warp's
+// inner loop never re-decodes instruction words. The arrays are indexed
+// by WORD index, not instruction index: a MOVI's immediate word gets its
+// own slot, decoded from its own bits exactly as the v1 interpreter
+// would decode it if a branch landed there, and branch offsets stay
+// word-relative. Control flow is therefore bit-identical to v1 — this
+// is a decode cache, not a new program representation.
+
+struct DecodedShader {
+    var op: [UInt32] = []     // raw opcode byte per word
+    var d: [UInt32] = []      // dst byte per word
+    var a: [UInt32] = []      // source A byte per word
+    var b: [UInt32] = []      // source B byte per word
+    var imm: [UInt32] = []    // MOVI only: the following word (0 past end)
+    /// Bitmask of LDATTR slots the program can read (bit = slot).
+    /// The rasteriser uses the fragment program's mask to interpolate
+    /// only the varyings that can actually be observed.
+    var attrSlotMask: UInt32 = 0
+    var count: Int { op.count }
+
+    init(_ program: [UInt32]) {
+        let n = program.count
+        op = [UInt32](repeating: 0, count: n)
+        d = [UInt32](repeating: 0, count: n)
+        a = [UInt32](repeating: 0, count: n)
+        b = [UInt32](repeating: 0, count: n)
+        imm = [UInt32](repeating: 0, count: n)
+        for i in 0..<n {
+            let w = program[i]
+            let o = w & 0xFF
+            op[i] = o
+            d[i] = (w >> 8) & 0xFF
+            a[i] = (w >> 16) & 0xFF
+            b[i] = (w >> 24) & 0xFF
+            if o == GPOpcode.movi.rawValue {
+                imm[i] = (i + 1 < n) ? program[i + 1] : 0
+            } else if o == GPOpcode.ldattr.rawValue, a[i] < 32 {
+                attrSlotMask |= UInt32(1) << a[i]
+            }
+        }
+    }
+}
+
 // MARK: - Executor
+//
+// Speed round (v2): the v1 executor re-decoded every instruction from
+// its packed word on every warp, indexed the register file through a
+// bounds-checked Swift array with a computed index per component, and
+// routed every operation through nested helper closures. The semantics
+// were never the problem — the per-element overhead was. This executor
+// runs the SAME semantics out of a DecodedShader:
+//   * register file in a stack-allocated SIMD4<Float> buffer (the
+//     [reg][lane][comp] layout becomes 512 vec4s; a register's lane
+//     vectors are contiguous), so component-wise FP ops are single
+//     vector ops per lane with no bounds checks anywhere;
+//   * operations whose results depend on Swift's exact scalar semantics
+//     (MIN/MAX NaN behaviour, DOT accumulation order, F2I/I2F
+//     conversions, the integer ops on bit patterns) run scalar loops
+//     over raw pointers with the v1 expressions copied verbatim;
+//   * per-issue bookkeeping (pc, steps guard, lane-op counting) mirrors
+//     v1 exactly, including END not counting itself and unknown
+//     opcodes executing as NOP.
 
 enum ShaderExecutor {
     static let warpSize = 32
@@ -183,161 +246,190 @@ enum ShaderExecutor {
     /// Runs one warp of `program` with `lanes` active lanes (1...32).
     /// Returns the number of lane-instructions executed (issue count x
     /// active lanes at each issue) — the number the device reports as
-    /// compute-unit work.
+    /// compute-unit work. (v1-compatible entry point: decodes per call;
+    /// the pipeline decodes once per draw/launch and uses the
+    /// DecodedShader overload.)
     static func runWarp(program: [UInt32], lanes: Int, ctx: WarpContext) -> Int {
         let n = max(0, min(warpSize, lanes))
         if n == 0 || program.isEmpty { return 0 }
-        // Register file: [reg][lane][comp] flattened as (reg*32 + lane)*4 + comp.
-        var regs = [Float](repeating: 0, count: regCount * warpSize * 4)
-        @inline(__always) func idx(_ r: Int, _ lane: Int, _ c: Int) -> Int { (r * warpSize + lane) * 4 + c }
+        return runWarp(decoded: DecodedShader(program), lanes: n, ctx: ctx)
+    }
+
+    static func runWarp(decoded: DecodedShader, lanes: Int, ctx: WarpContext) -> Int {
+        let n = max(0, min(warpSize, lanes))
+        if n == 0 || decoded.count == 0 { return 0 }
+        return ctx.uniforms.withUnsafeBufferPointer { ubuf in
+            withUnsafeTemporaryAllocation(of: SIMD4<Float>.self,
+                                          capacity: regCount * warpSize) { vbuf in
+                vbuf.initialize(repeating: SIMD4<Float>())
+                let vb = vbuf.baseAddress!
+                let rp = UnsafeMutableRawPointer(vb).assumingMemoryBound(to: Float.self)
+                let up = UnsafeMutableRawPointer(vb).assumingMemoryBound(to: UInt32.self)
+                return runLoop(decoded: decoded, n: n, ctx: ctx,
+                               ubuf: ubuf, vb: vb, rp: rp, up: up)
+            }
+        }
+    }
+
+    private static func runLoop(decoded: DecodedShader, n: Int, ctx: WarpContext,
+                                ubuf: UnsafeBufferPointer<Float>,
+                                vb: UnsafeMutablePointer<SIMD4<Float>>,
+                                rp: UnsafeMutablePointer<Float>,
+                                up: UnsafeMutablePointer<UInt32>) -> Int {
+        let opsA = decoded.op, dA = decoded.d, aA = decoded.a, bA = decoded.b, immA = decoded.imm
+        let wc = decoded.count
         var laneOps = 0
         var pc = 0
         var steps = 0
         let maxSteps = 100_000   // runaway-shader guard; a fault, not a hang
-        while pc >= 0 && pc < program.count && steps < maxSteps {
+        while pc >= 0 && pc < wc && steps < maxSteps {
             steps += 1
-            let w = program[pc]
-            let op = GPOpcode(rawValue: w & 0xFF) ?? .nop
-            let d = Int((w >> 8) & 0xFF)
-            let a = Int((w >> 16) & 0xFF)
-            let b = Int((w >> 24) & 0xFF)
+            let opc = opsA[pc]
+            let d = Int(dA[pc])
+            let a = Int(aA[pc])
+            let b = Int(bA[pc])
             var nextPc = pc + 1
-            switch op {
-            case .end:
+            switch opc {
+            case 0x52: // END — returns without counting itself (as v1)
                 return laneOps
-            case .bra:
+            case 0x50: // BRA — imm16 packed in the a|b bytes
+                laneOps += n
                 let rel = Int(Int16(bitPattern: UInt16(a | (b << 8))))
                 nextPc = pc + 1 + rel
+            case 0x51: // BRZ — condition register rides in the dst byte
                 laneOps += n
-            case .brz:
-                // Condition register is in the dst byte (builder encoding).
-                laneOps += n
-                if regs[idx(d, 0, 0)] == 0 {
+                if rp[d * 128] == 0 {
                     let rel = Int(Int16(bitPattern: UInt16(a | (b << 8))))
                     nextPc = pc + 1 + rel
                 }
-            case .movi:
+            case 0x02: // MOVI — splat of the following word's FP32 bits
                 laneOps += n
-                let imm: UInt32 = (pc + 1 < program.count) ? program[pc + 1] : 0
-                let v = Float(bitPattern: imm)
-                for lane in 0..<n {
-                    regs[idx(d, lane, 0)] = v
-                    regs[idx(d, lane, 1)] = v
-                    regs[idx(d, lane, 2)] = v
-                    regs[idx(d, lane, 3)] = v
-                }
+                let v = SIMD4<Float>(repeating: Float(bitPattern: immA[pc]))
+                let base = d * warpSize
+                for l in 0..<n { vb[base + l] = v }
                 nextPc = pc + 2
             default:
                 laneOps += n
-                execute(op, d: d, a: a, b: b, regs: &regs, lanes: n, ctx: ctx, idx: idx)
+                execute(opc, d: d, a: a, b: b, n: n, ctx: ctx, ubuf: ubuf, vb: vb, rp: rp, up: up)
             }
             pc = nextPc
         }
         return laneOps
     }
 
-    private static func execute(_ op: GPOpcode, d: Int, a: Int, b: Int,
-                                regs: inout [Float], lanes n: Int,
-                                ctx: WarpContext,
-                                idx: (Int, Int, Int) -> Int) {
-        func comp(_ op: GPOpcode, _ f: (Float, Float) -> Float) {
-            for lane in 0..<n { for c in 0..<4 {
-                regs[idx(d, lane, c)] = f(regs[idx(a, lane, c)], regs[idx(b, lane, c)])
-            } }
-        }
-        func comp1(_ op: GPOpcode, _ f: (Float) -> Float) {
-            for lane in 0..<n { for c in 0..<4 {
-                regs[idx(d, lane, c)] = f(regs[idx(a, lane, c)])
-            } }
-        }
-        switch op {
-        case .nop, .end, .bra, .brz:
-            break
-        case .mov:
-            for lane in 0..<n { for c in 0..<4 { regs[idx(d, lane, c)] = regs[idx(a, lane, c)] } }
-        case .movi:
-            break // handled in runWarp (needs the following word)
-        case .ldunif:
+    private static func execute(_ opc: UInt32, d: Int, a: Int, b: Int, n: Int,
+                                ctx: WarpContext, ubuf: UnsafeBufferPointer<Float>,
+                                vb: UnsafeMutablePointer<SIMD4<Float>>,
+                                rp: UnsafeMutablePointer<Float>,
+                                up: UnsafeMutablePointer<UInt32>) {
+        // Register bases: SIMD4 units for vector ops, Float units for
+        // scalar ops. (reg * warpSize lanes; reg * 128 floats.)
+        let db = d * warpSize, ab = a * warpSize, bb = b * warpSize
+        let df = d * 128, af = a * 128, bf = b * 128
+        let span = n * 4
+        switch opc {
+        case 0x01: // MOV
+            for l in 0..<n { vb[db + l] = vb[ab + l] }
+        case 0x03: // LDUNIF — warp-uniform value; guarded read done once
             let base = a * 4
-            for lane in 0..<n { for c in 0..<4 {
-                regs[idx(d, lane, c)] = base + c < ctx.uniforms.count ? ctx.uniforms[base + c] : 0
-            } }
-        case .ldattr:
-            for lane in 0..<n {
-                let v = ctx.attrProvider(lane, a)
-                regs[idx(d, lane, 0)] = v.0; regs[idx(d, lane, 1)] = v.1
-                regs[idx(d, lane, 2)] = v.2; regs[idx(d, lane, 3)] = v.3
+            let v = SIMD4<Float>(base + 0 < ubuf.count ? ubuf[base + 0] : 0,
+                                 base + 1 < ubuf.count ? ubuf[base + 1] : 0,
+                                 base + 2 < ubuf.count ? ubuf[base + 2] : 0,
+                                 base + 3 < ubuf.count ? ubuf[base + 3] : 0)
+            for l in 0..<n { vb[db + l] = v }
+        case 0x04: // LDATTR
+            for l in 0..<n {
+                let v = ctx.attrProvider(l, a)
+                vb[db + l] = SIMD4<Float>(v.0, v.1, v.2, v.3)
             }
-        case .out:
-            for lane in 0..<n {
-                ctx.outWriter(lane, d, regs[idx(a, lane, 0)], regs[idx(a, lane, 1)],
-                              regs[idx(a, lane, 2)], regs[idx(a, lane, 3)])
+        case 0x05: // OUT
+            for l in 0..<n {
+                let v = vb[ab + l]
+                ctx.outWriter(l, d, v.x, v.y, v.z, v.w)
             }
-        case .add: comp(op) { $0 + $1 }
-        case .sub: comp(op) { $0 - $1 }
-        case .mul: comp(op) { $0 * $1 }
-        case .div: comp(op) { $0 / $1 }
-        case .min: comp(op) { Swift.min($0, $1) }
-        case .max: comp(op) { Swift.max($0, $1) }
-        case .mad:
-            for lane in 0..<n { for c in 0..<4 {
-                regs[idx(d, lane, c)] = regs[idx(a, lane, c)] * regs[idx(b, lane, c)] + regs[idx(d, lane, c)]
-            } }
-        case .rcp:  comp1(op) { 1 / $0 }
-        case .sqrt: comp1(op) { $0 <= 0 ? 0 : sqrtf($0) }
-        case .rsq:  comp1(op) { $0 <= 0 ? 0 : 1 / sqrtf($0) }
-        case .sin:  comp1(op) { sinf($0) }
-        case .cos:  comp1(op) { cosf($0) }
-        case .dot3, .dot4:
-            let lim = op == .dot3 ? 3 : 4
-            for lane in 0..<n {
+        case 0x10: // ADD
+            for l in 0..<n { vb[db + l] = vb[ab + l] + vb[bb + l] }
+        case 0x11: // SUB
+            for l in 0..<n { vb[db + l] = vb[ab + l] - vb[bb + l] }
+        case 0x12: // MUL
+            for l in 0..<n { vb[db + l] = vb[ab + l] * vb[bb + l] }
+        case 0x13: // DIV
+            for l in 0..<n { vb[db + l] = vb[ab + l] / vb[bb + l] }
+        case 0x14: // MIN — Swift.min per component (v1 expression)
+            for i in 0..<span { rp[df + i] = Swift.min(rp[af + i], rp[bf + i]) }
+        case 0x15: // MAX — Swift.max per component (v1 expression)
+            for i in 0..<span { rp[df + i] = Swift.max(rp[af + i], rp[bf + i]) }
+        case 0x16: // MAD — rd = ra * rb + rd (two ops, no fusion, as v1)
+            for l in 0..<n { vb[db + l] = vb[ab + l] * vb[bb + l] + vb[db + l] }
+        case 0x17: // RCP
+            let one = SIMD4<Float>(repeating: 1)
+            for l in 0..<n { vb[db + l] = one / vb[ab + l] }
+        case 0x18: // SQRT — v1: x <= 0 ? 0 : sqrtf(x)
+            for i in 0..<span { let x = rp[af + i]; rp[df + i] = x <= 0 ? 0 : sqrtf(x) }
+        case 0x19: // RSQ — v1: x <= 0 ? 0 : 1 / sqrtf(x)
+            for i in 0..<span { let x = rp[af + i]; rp[df + i] = x <= 0 ? 0 : 1 / sqrtf(x) }
+        case 0x1A: // SIN
+            for i in 0..<span { rp[df + i] = sinf(rp[af + i]) }
+        case 0x1B: // COS
+            for i in 0..<span { rp[df + i] = cosf(rp[af + i]) }
+        case 0x1C, 0x1D: // DOT3 / DOT4 — v1 accumulation order (s += per comp)
+            let lim = opc == 0x1C ? 3 : 4
+            for l in 0..<n {
+                let ao = af + l * 4, bo = bf + l * 4
                 var s: Float = 0
-                for c in 0..<lim { s += regs[idx(a, lane, c)] * regs[idx(b, lane, c)] }
-                for c in 0..<4 { regs[idx(d, lane, c)] = s }
+                for c in 0..<lim { s += rp[ao + c] * rp[bo + c] }
+                vb[db + l] = SIMD4<Float>(repeating: s)
             }
-        case .cmplt: comp(op) { $0 < $1 ? 1 : 0 }
-        case .sel:
-            for lane in 0..<n { for c in 0..<4 {
-                if regs[idx(a, lane, c)] != 0 { regs[idx(d, lane, c)] = regs[idx(b, lane, c)] }
-            } }
-        case .f2i:
-            comp1(op) { v in Float(bitPattern: UInt32(bitPattern: Int32(v.isFinite ? v : 0))) }
-        case .i2f:
-            comp1(op) { v in Float(Int32(bitPattern: v.bitPattern)) }
-        case .iadd: icomp(regs: &regs, d: d, a: a, b: b, n: n, idx: idx) { $0 &+ $1 }
-        case .isub: icomp(regs: &regs, d: d, a: a, b: b, n: n, idx: idx) { $0 &- $1 }
-        case .imul: icomp(regs: &regs, d: d, a: a, b: b, n: n, idx: idx) { $0 &* $1 }
-        case .iand: icomp(regs: &regs, d: d, a: a, b: b, n: n, idx: idx) { $0 & $1 }
-        case .ior:  icomp(regs: &regs, d: d, a: a, b: b, n: n, idx: idx) { $0 | $1 }
-        case .ixor: icomp(regs: &regs, d: d, a: a, b: b, n: n, idx: idx) { $0 ^ $1 }
-        case .ishl: icomp(regs: &regs, d: d, a: a, b: b, n: n, idx: idx) { $0 << ($1 & 31) }
-        case .ishr: icomp(regs: &regs, d: d, a: a, b: b, n: n, idx: idx) { $0 >> ($1 & 31) }
-        case .ldtex:
-            for lane in 0..<n {
-                let v = ctx.texSampler(b, regs[idx(a, lane, 0)], regs[idx(a, lane, 1)])
-                regs[idx(d, lane, 0)] = v.0; regs[idx(d, lane, 1)] = v.1
-                regs[idx(d, lane, 2)] = v.2; regs[idx(d, lane, 3)] = v.3
+        case 0x20: // CMPLT — (ra < rb) ? 1 : 0 per component
+            for i in 0..<span { rp[df + i] = rp[af + i] < rp[bf + i] ? 1 : 0 }
+        case 0x21: // SEL — rd = (ra != 0) ? rb : rd per component
+            for i in 0..<span { if rp[af + i] != 0 { rp[df + i] = rp[bf + i] } }
+        case 0x22: // F2I — v1 expression verbatim
+            for i in 0..<span {
+                let v = rp[af + i]
+                rp[df + i] = Float(bitPattern: UInt32(bitPattern: Int32(v.isFinite ? v : 0)))
             }
-        case .ldbuf:
-            for lane in 0..<n {
-                let addr = Int(Int32(bitPattern: regs[idx(a, lane, 0)].bitPattern))
-                regs[idx(d, lane, 0)] = Float(bitPattern: ctx.bufLoad(addr))
-                regs[idx(d, lane, 1)] = 0; regs[idx(d, lane, 2)] = 0; regs[idx(d, lane, 3)] = 0
+        case 0x23: // I2F — v1 expression verbatim
+            for i in 0..<span { rp[df + i] = Float(Int32(bitPattern: rp[af + i].bitPattern)) }
+        case 0x30: // IADD
+            for i in 0..<span { up[df + i] = up[af + i] &+ up[bf + i] }
+        case 0x31: // ISUB
+            for i in 0..<span { up[df + i] = up[af + i] &- up[bf + i] }
+        case 0x32: // IMUL
+            for i in 0..<span { up[df + i] = up[af + i] &* up[bf + i] }
+        case 0x33: // IAND
+            for i in 0..<span { up[df + i] = up[af + i] & up[bf + i] }
+        case 0x34: // IOR
+            for i in 0..<span { up[df + i] = up[af + i] | up[bf + i] }
+        case 0x35: // IXOR
+            for i in 0..<span { up[df + i] = up[af + i] ^ up[bf + i] }
+        case 0x36: // ISHL — shift counts masked to 31, as v1
+            for i in 0..<span {
+                let x = Int32(bitPattern: up[af + i]), y = Int32(bitPattern: up[bf + i])
+                up[df + i] = UInt32(bitPattern: x << (y & 31))
             }
-        case .stbuf:
-            for lane in 0..<n {
-                let addr = Int(Int32(bitPattern: regs[idx(a, lane, 0)].bitPattern))
-                ctx.bufStore(addr, regs[idx(b, lane, 0)].bitPattern)
+        case 0x37: // ISHR — arithmetic shift, counts masked to 31, as v1
+            for i in 0..<span {
+                let x = Int32(bitPattern: up[af + i]), y = Int32(bitPattern: up[bf + i])
+                up[df + i] = UInt32(bitPattern: x >> (y & 31))
             }
+        case 0x40: // LDTEX — texture(unit b).sample(ra.xy)
+            for l in 0..<n {
+                let v = ctx.texSampler(b, rp[af + l * 4], rp[af + l * 4 + 1])
+                vb[db + l] = SIMD4<Float>(v.0, v.1, v.2, v.3)
+            }
+        case 0x41: // LDBUF — rd.x bits = u32 at byte addr from ra.x bits
+            for l in 0..<n {
+                let addr = Int(Int32(bitPattern: rp[af + l * 4].bitPattern))
+                vb[db + l] = SIMD4<Float>(Float(bitPattern: ctx.bufLoad(addr)), 0, 0, 0)
+            }
+        case 0x42: // STBUF — u32 at byte addr from ra.x bits = rb.x bits
+            for l in 0..<n {
+                let addr = Int(Int32(bitPattern: rp[af + l * 4].bitPattern))
+                ctx.bufStore(addr, rp[bf + l * 4].bitPattern)
+            }
+        default:
+            break // NOP (0x00) and every unknown opcode, exactly as v1
         }
-    }
-
-    private static func icomp(regs: inout [Float], d: Int, a: Int, b: Int, n: Int,
-                              idx: (Int, Int, Int) -> Int, _ f: (Int32, Int32) -> Int32) {
-        for lane in 0..<n { for c in 0..<4 {
-            let x = Int32(bitPattern: regs[idx(a, lane, c)].bitPattern)
-            let y = Int32(bitPattern: regs[idx(b, lane, c)].bitPattern)
-            regs[idx(d, lane, c)] = Float(bitPattern: UInt32(bitPattern: f(x, y)))
-        } }
     }
 }

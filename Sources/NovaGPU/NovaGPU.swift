@@ -23,9 +23,30 @@
 //   attr2 uv, attr3 colour rgba.
 //
 // Pipeline: vertex fetch -> vertex shader (warps over CUs) -> clip
-// (Sutherland-Hodgman, 6 planes) -> viewport -> rasterise (bands over
-// clusters, fragments in warps of 32) -> fragment shader -> depth test
-// (early-z; shaders cannot discard) -> RGBA8888 framebuffer in VRAM.
+// (Sutherland-Hodgman, 6 planes) -> viewport -> rasterise (row chunks
+// over clusters, fragments in warps of 32) -> fragment shader -> depth
+// test (early-z; shaders cannot discard) -> RGBA8888 framebuffer in
+// VRAM.
+//
+// Speed round (v2) — execution only, architecture and results
+// unchanged. Measured profile of v1 (share of frame CPU time): the
+// rasteriser rescanned every triangle against every one of 48 row
+// bands (~1.4M calls per frame); every accepted fragment allocated a
+// fresh 8x4 nested varying array and interpolated all 8 slots whether
+// or not the fragment program could read them; every pixel went back
+// through the locked VRAM write path; vertex/index data was fetched
+// one float at a time through that same locked path. v2: triangles
+// are binned once into the row chunks they actually touch and chunks
+// run over the clusters; warp varyings live in one flat scratch
+// buffer per chunk and only the slots the fragment program reads
+// (DecodedShader.attrSlotMask) are interpolated; framebuffer pixels
+// are written through a block-pointer table resolved once per draw
+// (uncommitted blocks fall back to the locked write, so semantics are
+// unchanged); vertex and index buffers are snapshotted with one
+// locked read each. Every FP expression in the geometry, coverage,
+// interpolation and shading paths is the v1 expression verbatim, and
+// per-pixel processing order (triangle order, row order) is
+// preserved — the output is byte-identical, proven by checksum.
 
 import Foundation
 
@@ -148,6 +169,50 @@ final class NovaGPU {
     }
     func vramReadF32(at addr: UInt64) -> Float { Float(bitPattern: vramReadU32(at: addr)) }
     func vramWriteF32(at addr: UInt64, _ v: Float) { vramWriteU32(at: addr, v.bitPattern) }
+
+    // MARK: - Block-pointer tables (speed round)
+    //
+    // The hot paths (framebuffer writes during rasterisation, buffer
+    // access during compute launches) resolve the range's 64 KiB block
+    // pointers ONCE under the lock, then run lock-free against raw
+    // pointers. Blocks are never freed while a draw/launch that
+    // resolved them is in flight (bus commands execute serially), so
+    // the pointers stay valid for the operation's duration.
+
+    /// Snapshot of the block pointers covering a VRAM range; nil
+    /// entries are uncommitted blocks (reads as zero; writes must go
+    /// through the locked vramWrite, which commits — callers do this).
+    func blockPointers(addr: UInt64, size: UInt64) -> [UnsafeMutablePointer<UInt8>?] {
+        let first = blockIndex(addr)
+        let last = blockIndex(addr + max(size, 1) - 1)
+        vramLock.lock(); defer { vramLock.unlock() }
+        var out: [UnsafeMutablePointer<UInt8>?] = []
+        out.reserveCapacity(last - first + 1)
+        for bi in first...last { out.append(blocks[bi]) }
+        return out
+    }
+
+    /// Like blockPointers, but commits every block in the range first.
+    /// Used for compute-launch buffers (≤ 256 MiB), where the whole
+    /// buffer is the kernel's working set; ranges above that keep the
+    /// sparse behaviour via the snapshot + locked-fallback path.
+    func committedBlockPointers(addr: UInt64, size: UInt64) -> [UnsafeMutablePointer<UInt8>] {
+        let first = blockIndex(addr)
+        let last = blockIndex(addr + max(size, 1) - 1)
+        vramLock.lock(); defer { vramLock.unlock() }
+        var out: [UnsafeMutablePointer<UInt8>] = []
+        out.reserveCapacity(last - first + 1)
+        for bi in first...last {
+            if let p = blocks[bi] { out.append(p) }
+            else {
+                let p = UnsafeMutablePointer<UInt8>.allocate(capacity: Self.blockSize)
+                p.initialize(repeating: 0, count: Self.blockSize)
+                blocks[bi] = p
+                out.append(p)
+            }
+        }
+        return out
+    }
 
     // MARK: - Allocator (first-fit free list over the 2 GiB space)
 
@@ -279,35 +344,110 @@ final class NovaGPU {
         guard !computeProgram.isEmpty else { throw GPUError.badProgram }
         guard let bufSize = allocationSize(buffer) else { throw GPUError.badHandle(buffer) }
         let warpCount = (lanes + ShaderExecutor.warpSize - 1) / ShaderExecutor.warpSize
-        let perClusterPtr = UnsafeMutablePointer<UInt64>.allocate(capacity: Self.clusterCount)
-        perClusterPtr.initialize(repeating: 0, count: Self.clusterCount)
-        defer { perClusterPtr.deinitialize(count: Self.clusterCount); perClusterPtr.deallocate() }
-        let prog = computeProgram
+        let decoded = DecodedShader(computeProgram)
         let unis = uniforms
-        DispatchQueue.concurrentPerform(iterations: warpCount) { warp in
-            let base = warp * ShaderExecutor.warpSize
-            let count = min(ShaderExecutor.warpSize, lanes - base)
-            if count <= 0 { return }
-            var ctx = WarpContext.dummy()
-            ctx.uniforms = unis
-            ctx.attrProvider = { lane, slot in
-                slot == 0 ? (Float(base + lane), 0, 0, 0) : (0, 0, 0, 0)
+        let firstBlock = blockIndex(buffer)
+        // Buffer access path: buffers up to 256 MiB are committed up
+        // front and accessed through raw block pointers; larger (still
+        // sparse) buffers use a pointer snapshot whose uncommitted
+        // blocks fall back to the locked v1 accessors, so results are
+        // identical either way.
+        let fastTable: [UnsafeMutablePointer<UInt8>] =
+            bufSize <= 256 * 1024 * 1024 ? committedBlockPointers(addr: buffer, size: bufSize) : []
+        let snapTable: [UnsafeMutablePointer<UInt8>?] =
+            fastTable.isEmpty ? blockPointers(addr: buffer, size: bufSize) : []
+        let perWarpOps = UnsafeMutablePointer<UInt64>.allocate(capacity: max(warpCount, 1))
+        perWarpOps.initialize(repeating: 0, count: max(warpCount, 1))
+        defer { perWarpOps.deinitialize(count: max(warpCount, 1)); perWarpOps.deallocate() }
+
+        func runWarps(_ body: @escaping (Int, Int) -> WarpContext) {
+            DispatchQueue.concurrentPerform(iterations: warpCount) { warp in
+                let base = warp * ShaderExecutor.warpSize
+                let count = min(ShaderExecutor.warpSize, lanes - base)
+                if count <= 0 { return }
+                let ops = ShaderExecutor.runWarp(decoded: decoded, lanes: count,
+                                                 ctx: body(warp, base))
+                perWarpOps[warp] = UInt64(ops)
             }
-            ctx.bufLoad = { [self] addr in
-                guard addr >= 0, UInt64(addr) + 4 <= bufSize else { return 0 }
-                return vramReadU32(at: buffer + UInt64(addr))
+        }
+
+        if !fastTable.isEmpty {
+            fastTable.withUnsafeBufferPointer { tb in
+                runWarps { _, base in
+                    var ctx = WarpContext.dummy()
+                    ctx.uniforms = unis
+                    ctx.attrProvider = { lane, slot in
+                        slot == 0 ? (Float(base + lane), 0, 0, 0) : (0, 0, 0, 0)
+                    }
+                    ctx.bufLoad = { addr in
+                        guard addr >= 0, UInt64(addr) + 4 <= bufSize else { return 0 }
+                        var v: UInt32 = 0
+                        var byteAddr = buffer + UInt64(addr)
+                        for k in 0..<4 {
+                            v |= UInt32(tb[Int(byteAddr >> 16) - firstBlock][Int(byteAddr & 0xFFFF)]) << UInt32(k * 8)
+                            byteAddr += 1
+                        }
+                        return v
+                    }
+                    ctx.bufStore = { addr, value in
+                        guard addr >= 0, UInt64(addr) + 4 <= bufSize else { return }
+                        var byteAddr = buffer + UInt64(addr)
+                        for k in 0..<4 {
+                            tb[Int(byteAddr >> 16) - firstBlock][Int(byteAddr & 0xFFFF)] =
+                                UInt8((value >> UInt32(k * 8)) & 0xFF)
+                            byteAddr += 1
+                        }
+                    }
+                    return ctx
+                }
             }
-            ctx.bufStore = { [self] addr, value in
-                guard addr >= 0, UInt64(addr) + 4 <= bufSize else { return }
-                vramWriteU32(at: buffer + UInt64(addr), value)
+        } else {
+            snapTable.withUnsafeBufferPointer { tb in
+                runWarps { _, base in
+                    var ctx = WarpContext.dummy()
+                    ctx.uniforms = unis
+                    ctx.attrProvider = { lane, slot in
+                        slot == 0 ? (Float(base + lane), 0, 0, 0) : (0, 0, 0, 0)
+                    }
+                    ctx.bufLoad = { [self] addr in
+                        guard addr >= 0, UInt64(addr) + 4 <= bufSize else { return 0 }
+                        let a = buffer + UInt64(addr)
+                        if tb[Int(a >> 16) - firstBlock] != nil,
+                           tb[Int((a + 3) >> 16) - firstBlock] != nil {
+                            var v: UInt32 = 0
+                            var byteAddr = a
+                            for k in 0..<4 {
+                                v |= UInt32(tb[Int(byteAddr >> 16) - firstBlock]![Int(byteAddr & 0xFFFF)]) << UInt32(k * 8)
+                                byteAddr += 1
+                            }
+                            return v
+                        }
+                        return vramReadU32(at: a)
+                    }
+                    ctx.bufStore = { [self] addr, value in
+                        guard addr >= 0, UInt64(addr) + 4 <= bufSize else { return }
+                        let a = buffer + UInt64(addr)
+                        if tb[Int(a >> 16) - firstBlock] != nil,
+                           tb[Int((a + 3) >> 16) - firstBlock] != nil {
+                            var byteAddr = a
+                            for k in 0..<4 {
+                                tb[Int(byteAddr >> 16) - firstBlock]![Int(byteAddr & 0xFFFF)] =
+                                    UInt8((value >> UInt32(k * 8)) & 0xFF)
+                                byteAddr += 1
+                            }
+                            return
+                        }
+                        vramWriteU32(at: a, value)
+                    }
+                    return ctx
+                }
             }
-            let ops = ShaderExecutor.runWarp(program: prog, lanes: count, ctx: ctx)
-            perClusterPtr[warp % Self.clusterCount] += UInt64(ops)
         }
         stats.launches += 1
-        for i in 0..<Self.clusterCount {
-            let v = perClusterPtr[i]
-            stats.lanesPerCluster[i] += v; stats.laneOps += v
+        for warp in 0..<warpCount {
+            let v = perWarpOps[warp]
+            stats.lanesPerCluster[warp % Self.clusterCount] += v
+            stats.laneOps += v
         }
         stats.warpsIssued += UInt64(warpCount)
     }
@@ -316,7 +456,18 @@ final class NovaGPU {
 
     private struct ShadedVertex {
         var clip: (Float, Float, Float, Float) = (0, 0, 0, 1)
-        var varyings: [[Float]] = [[Float]](repeating: [0, 0, 0, 0], count: 8)  // slots 1..7 used
+        /// Varyings, flat: slot s occupies [s*4 + 0 ... s*4 + 3], slots 0..7.
+        /// (Slot 0 is never written — OUT 0 is the clip position.)
+        var varyings: [Float] = [Float](repeating: 0, count: 32)
+    }
+
+    /// A clipped, fan-triangulated triangle with its vertices' screen
+    /// coordinates precomputed once (v1 recomputed them per band).
+    private struct WorkTri {
+        var v0: ShadedVertex, v1: ShadedVertex, v2: ShadedVertex
+        var s0: (Float, Float, Float, Float)   // (x, y, z, invW)
+        var s1: (Float, Float, Float, Float)
+        var s2: (Float, Float, Float, Float)
     }
 
     /// Clears the framebuffer to an RGBA8888 colour + depth far.
@@ -339,61 +490,120 @@ final class NovaGPU {
         guard !vertexProgram.isEmpty, !fragmentProgram.isEmpty else { throw GPUError.badProgram }
         guard let vbSize = allocationSize(vertexBuffer) else { throw GPUError.badHandle(vertexBuffer) }
         guard let ibSize = allocationSize(indexBuffer) else { throw GPUError.badHandle(indexBuffer) }
-        guard allocationSize(framebuffer) != nil, fbWidth > 0, fbHeight > 0 else { throw GPUError.badState("no framebuffer") }
+        guard let fbAllocSize = allocationSize(framebuffer), fbWidth > 0, fbHeight > 0 else { throw GPUError.badState("no framebuffer") }
         let vertexCount = Int(vbSize / 48)
         let idxCount = min(indexCount, Int(ibSize / 4))
         guard idxCount >= 3 else { throw GPUError.badState("draw with < 3 indices") }
+
+        let vDecoded = DecodedShader(vertexProgram)
+        let fDecoded = DecodedShader(fragmentProgram)
+        // Varying slots the fragment program can read — the only ones
+        // clip interpolation and raster interpolation need to compute.
+        // (Values in unread slots are unobservable: the fragment stage
+        // can only read varyings through LDATTR.)
+        var usedSlots: [Int] = []
+        for s in 0..<8 where fDecoded.attrSlotMask & (UInt32(1) << UInt32(s)) != 0 {
+            usedSlots.append(s)
+        }
+        let unis = uniforms
+        let width = fbWidth, height = fbHeight
+
+        // ---- Buffer snapshots: one locked read each (v1 fetched the
+        // vertex buffer one float and the index buffer one word at a
+        // time through the lock).
+        let vbFloats = UnsafeMutablePointer<Float>.allocate(capacity: max(vertexCount * 12, 1))
+        defer { vbFloats.deallocate() }
+        vramRead(at: vertexBuffer, count: vertexCount * 48).withUnsafeBufferPointer { src in
+            if let sp = src.baseAddress, vertexCount > 0 {
+                memcpy(vbFloats, sp, vertexCount * 48)
+            }
+        }
+        let ibWords = UnsafeMutablePointer<UInt32>.allocate(capacity: max(idxCount, 1))
+        defer { ibWords.deallocate() }
+        vramRead(at: indexBuffer, count: idxCount * 4).withUnsafeBufferPointer { src in
+            if let sp = src.baseAddress, idxCount > 0 {
+                memcpy(ibWords, sp, idxCount * 4)
+            }
+        }
 
         // ---- Vertex stage: one warp per 32 vertices, warps over clusters.
         let shadedPtr = UnsafeMutablePointer<ShadedVertex>.allocate(capacity: max(vertexCount, 1))
         shadedPtr.initialize(repeating: ShadedVertex(), count: max(vertexCount, 1))
         defer { shadedPtr.deinitialize(count: max(vertexCount, 1)); shadedPtr.deallocate() }
-        let vb = vertexBuffer
-        let vprog = vertexProgram
-        let unis = uniforms
         let warpCount = (vertexCount + 31) / 32
-        let perClusterVPtr = UnsafeMutablePointer<UInt64>.allocate(capacity: Self.clusterCount)
-        perClusterVPtr.initialize(repeating: 0, count: Self.clusterCount)
-        defer { perClusterVPtr.deinitialize(count: Self.clusterCount); perClusterVPtr.deallocate() }
+        let perWarpOps = UnsafeMutablePointer<UInt64>.allocate(capacity: max(warpCount, 1))
+        perWarpOps.initialize(repeating: 0, count: max(warpCount, 1))
+        defer { perWarpOps.deinitialize(count: max(warpCount, 1)); perWarpOps.deallocate() }
+        let vbF = vbFloats
         DispatchQueue.concurrentPerform(iterations: warpCount) { warp in
             let base = warp * 32
             let count = min(32, vertexCount - base)
-            var outs = [ShadedVertex](repeating: ShadedVertex(), count: 32)
+            var outs: [ShadedVertex] = (0..<32).map { _ in ShadedVertex() }
             var ctx = WarpContext.dummy()
             ctx.uniforms = unis
-            ctx.attrProvider = { [self] lane, slot in
-                let vi = base + lane
-                let o = vb + UInt64(vi * 48)
+            ctx.attrProvider = { lane, slot in
+                let o = (base + lane) * 12
                 switch slot {
-                case 0: return (vramReadF32(at: o), vramReadF32(at: o + 4), vramReadF32(at: o + 8), 1)
-                case 1: return (vramReadF32(at: o + 12), vramReadF32(at: o + 16), vramReadF32(at: o + 20), 0)
-                case 2: return (vramReadF32(at: o + 24), vramReadF32(at: o + 28), 0, 0)
-                case 3: return (vramReadF32(at: o + 32), vramReadF32(at: o + 36), vramReadF32(at: o + 40), vramReadF32(at: o + 44))
+                case 0: return (vbF[o], vbF[o + 1], vbF[o + 2], 1)
+                case 1: return (vbF[o + 3], vbF[o + 4], vbF[o + 5], 0)
+                case 2: return (vbF[o + 6], vbF[o + 7], 0, 0)
+                case 3: return (vbF[o + 8], vbF[o + 9], vbF[o + 10], vbF[o + 11])
                 default: return (0, 0, 0, 0)
                 }
             }
             ctx.outWriter = { lane, slot, x, y, z, w in
                 if slot == 0 { outs[lane].clip = (x, y, z, w) }
-                else if slot >= 1 && slot < 8 { outs[lane].varyings[slot] = [x, y, z, w] }
+                else if slot >= 1 && slot < 8 {
+                    let o = slot * 4
+                    outs[lane].varyings[o] = x; outs[lane].varyings[o + 1] = y
+                    outs[lane].varyings[o + 2] = z; outs[lane].varyings[o + 3] = w
+                }
             }
-            let ops = ShaderExecutor.runWarp(program: vprog, lanes: count, ctx: ctx)
-            perClusterVPtr[warp % Self.clusterCount] += UInt64(ops)
+            let ops = ShaderExecutor.runWarp(decoded: vDecoded, lanes: count, ctx: ctx)
+            perWarpOps[warp] = UInt64(ops)
             for i in 0..<count { shadedPtr[base + i] = outs[i] }
         }
-        var shaded = [ShadedVertex](repeating: ShadedVertex(), count: vertexCount)
-        for i in 0..<vertexCount { shaded[i] = shadedPtr[i] }
-        var perClusterV = [UInt64](repeating: 0, count: Self.clusterCount)
-        for i in 0..<Self.clusterCount { perClusterV[i] = perClusterVPtr[i] }
-
-        // ---- Index fetch + primitive assembly.
-        var indices = [Int](repeating: 0, count: idxCount)
-        for i in 0..<idxCount { indices[i] = Int(vramReadU32(at: indexBuffer + UInt64(i * 4))) }
+        for warp in 0..<warpCount {
+            let v = perWarpOps[warp]
+            stats.lanesPerCluster[warp % Self.clusterCount] += v
+            stats.laneOps += v
+        }
         stats.trianglesIn += UInt64(idxCount / 3)
 
-        // ---- Clip + viewport + rasterise, in horizontal bands.
-        // Bands own disjoint framebuffer rows, so the shared depth
-        // buffer (raw pointer) is written without overlap per band.
-        let width = fbWidth, height = fbHeight
+        // ---- Clip + fan-triangulate once, into a work list with
+        // precomputed screen coordinates, then bin each triangle into
+        // the row chunks its screen Y range touches. (v1 re-ran the
+        // full clip/screen/rasterise prologue for every triangle in
+        // every one of the 48 bands.)
+        func screenOf(_ v: ShadedVertex) -> (Float, Float, Float, Float) {
+            let iw = 1 / v.clip.3
+            return ((v.clip.0 * iw * 0.5 + 0.5) * Float(width),
+                    (0.5 - v.clip.1 * iw * 0.5) * Float(height),
+                    v.clip.2 * iw, iw)
+        }
+        var work: [WorkTri] = []
+        work.reserveCapacity(idxCount / 3)
+        for t in stride(from: 0, to: idxCount - 2, by: 3) {
+            let tri = [shadedPtr[Int(ibWords[t])],
+                       shadedPtr[Int(ibWords[t + 1])],
+                       shadedPtr[Int(ibWords[t + 2])]]
+            let clipped = Self.clipTriangle(tri, usedSlots: usedSlots)
+            if clipped.count < 3 { continue }
+            for fan in 1..<(clipped.count - 1) {
+                let a = clipped[0], b = clipped[fan], c = clipped[fan + 1]
+                work.append(WorkTri(v0: a, v1: b, v2: c,
+                                    s0: screenOf(a), s1: screenOf(b), s2: screenOf(c)))
+            }
+        }
+        stats.trianglesOut += UInt64(work.count)
+
+        // ---- Rasterise in horizontal row chunks over the clusters.
+        // Chunks own disjoint framebuffer rows, so the shared depth
+        // buffer (raw pointer) and framebuffer writes never overlap
+        // between concurrent chunks — the same invariant v1's bands
+        // used, at finer granularity for load balance. Within a chunk,
+        // triangles are processed in work-list order and rows in
+        // increasing order, exactly as v1 processed them within a band.
         // Depth convention: this pipeline's projection does not flip
         // z, so a LARGER NDC z is NEARER the viewer. The buffer clears
         // to -1 (below the [0, 1] clip range) and the test keeps the
@@ -401,59 +611,63 @@ final class NovaGPU {
         let depthPtr = UnsafeMutablePointer<Float>.allocate(capacity: width * height)
         depthPtr.initialize(repeating: -1.0, count: width * height)
         defer { depthPtr.deinitialize(count: width * height); depthPtr.deallocate() }
-        let bandCount = min(Self.clusterCount, height)
-        let perClusterFPtr = UnsafeMutablePointer<UInt64>.allocate(capacity: Self.clusterCount)
-        let fragCountsPtr = UnsafeMutablePointer<UInt64>.allocate(capacity: Self.clusterCount)
-        let fragWarpsPtr = UnsafeMutablePointer<UInt64>.allocate(capacity: Self.clusterCount)
-        for p in [perClusterFPtr, fragCountsPtr, fragWarpsPtr] {
-            p.initialize(repeating: 0, count: Self.clusterCount)
-        }
-        defer {
-            for p in [perClusterFPtr, fragCountsPtr, fragWarpsPtr] {
-                p.deinitialize(count: Self.clusterCount); p.deallocate()
-            }
-        }
-        let fprog = fragmentProgram
+        let fbBlocks = blockPointers(addr: framebuffer, size: fbAllocSize)
+        let fbFirstBlock = blockIndex(framebuffer)
         let fb = framebuffer
-
-        // Clip + fan-triangulate once, into a read-only work list the
-        // bands share.
-        var work: [[ShadedVertex]] = []
-        work.reserveCapacity(idxCount / 3)
-        for t in stride(from: 0, to: idxCount - 2, by: 3) {
-            let tri = [shaded[indices[t]], shaded[indices[t + 1]], shaded[indices[t + 2]]]
-            let clipped = Self.clipTriangle(tri)
-            if clipped.count < 3 { continue }
-            for fan in 1..<(clipped.count - 1) {
-                work.append([clipped[0], clipped[fan], clipped[fan + 1]])
+        let chunkRows = 4
+        let chunkCount = (height + chunkRows - 1) / chunkRows
+        var bins: [[Int]] = [[Int]](repeating: [], count: chunkCount)
+        for (wi, wt) in work.enumerated() {
+            var ry0 = Int(floorf(min(wt.s0.1, min(wt.s1.1, wt.s2.1))))
+            var ry1 = Int(ceilf(max(wt.s0.1, max(wt.s1.1, wt.s2.1))))
+            if ry0 < 0 { ry0 = 0 }
+            if ry1 > height - 1 { ry1 = height - 1 }
+            if ry0 > ry1 { continue }
+            for c in (ry0 / chunkRows)...(ry1 / chunkRows) { bins[c].append(wi) }
+        }
+        let chunkOps = UnsafeMutablePointer<UInt64>.allocate(capacity: chunkCount)
+        let chunkFrags = UnsafeMutablePointer<UInt64>.allocate(capacity: chunkCount)
+        let chunkWarps = UnsafeMutablePointer<UInt64>.allocate(capacity: chunkCount)
+        for p in [chunkOps, chunkFrags, chunkWarps] { p.initialize(repeating: 0, count: chunkCount) }
+        defer {
+            for p in [chunkOps, chunkFrags, chunkWarps] {
+                p.deinitialize(count: chunkCount); p.deallocate()
             }
         }
-        stats.trianglesOut += UInt64(work.count)
 
-        DispatchQueue.concurrentPerform(iterations: bandCount) { band in
-            let y0 = band * height / bandCount
-            let y1 = (band + 1) * height / bandCount
-            var localOps: UInt64 = 0
-            var localFrags: UInt64 = 0
-            var localWarps: UInt64 = 0
-
-            for poly in work {
-                let r = self.rasterise(poly, width: width, height: height,
-                                       y0: y0, y1: y1, depth: depthPtr,
-                                       fb: fb, program: fprog, unis: unis)
-                localOps += r.ops; localFrags += r.frags; localWarps += r.warps
+        fbBlocks.withUnsafeBufferPointer { fbTable in
+            DispatchQueue.concurrentPerform(iterations: chunkCount) { chunk in
+                let y0 = chunk * chunkRows
+                let y1 = min(height, y0 + chunkRows)
+                // Per-chunk warp scratch, allocated once (v1 allocated
+                // a fresh nested varying array per accepted fragment).
+                let warpPx = UnsafeMutablePointer<Int>.allocate(capacity: 32)
+                let warpVar = UnsafeMutablePointer<Float>.allocate(capacity: 32 * 32)
+                let warpCol = UnsafeMutablePointer<Float>.allocate(capacity: 32 * 4)
+                defer { warpPx.deallocate(); warpVar.deallocate(); warpCol.deallocate() }
+                var localOps: UInt64 = 0
+                var localFrags: UInt64 = 0
+                var localWarps: UInt64 = 0
+                for wi in bins[chunk] {
+                    let r = self.rasterise(work[wi], width: width,
+                                           y0: y0, y1: y1, depth: depthPtr,
+                                           fbTable: fbTable, fbFirstBlock: fbFirstBlock, fb: fb,
+                                           decoded: fDecoded, unis: unis, usedSlots: usedSlots,
+                                           warpPx: warpPx, warpVar: warpVar, warpCol: warpCol)
+                    localOps += r.ops; localFrags += r.frags; localWarps += r.warps
+                }
+                chunkOps[chunk] = localOps
+                chunkFrags[chunk] = localFrags
+                chunkWarps[chunk] = localWarps
             }
-            perClusterFPtr[band] = localOps
-            fragCountsPtr[band] = localFrags
-            fragWarpsPtr[band] = localWarps
         }
 
         var fragWarps: UInt64 = 0
-        for i in 0..<Self.clusterCount {
-            stats.lanesPerCluster[i] += perClusterV[i] + perClusterFPtr[i]
-            stats.laneOps += perClusterV[i] + perClusterFPtr[i]
-            stats.fragmentsShaded += fragCountsPtr[i]
-            fragWarps += fragWarpsPtr[i]
+        for c in 0..<chunkCount {
+            stats.lanesPerCluster[c % Self.clusterCount] += chunkOps[c]
+            stats.laneOps += chunkOps[c]
+            stats.fragmentsShaded += chunkFrags[c]
+            fragWarps += chunkWarps[c]
         }
         stats.warpsIssued += UInt64(warpCount) + fragWarps
         stats.draws += 1
@@ -464,7 +678,10 @@ final class NovaGPU {
 
     // Sutherland–Hodgman clipping against the 6 clip planes, in clip
     // space (before the perspective divide), interpolating varyings.
-    private static func clipTriangle(_ tri: [ShadedVertex]) -> [ShadedVertex] {
+    // Only the fragment-readable slots are interpolated at clip points
+    // (see draw()); all other slots of a generated vertex stay zero,
+    // which no fragment program can observe.
+    private static func clipTriangle(_ tri: [ShadedVertex], usedSlots: [Int]) -> [ShadedVertex] {
         // Plane test functions: signed distance, keep >= 0.
         let planes: [(ShadedVertex) -> Float] = [
             { $0.clip.3 + $0.clip.0 },   // x >= -w
@@ -474,6 +691,14 @@ final class NovaGPU {
             { $0.clip.2 },               // z >= 0
             { $0.clip.3 - $0.clip.2 },   // z <= w
         ]
+        // Fast path: fully inside every plane — the Sutherland–Hodgman
+        // loop below returns the input unchanged in that case.
+        var allIn = true
+        for v in tri {
+            for plane in planes where plane(v) < 0 { allIn = false; break }
+            if !allIn { break }
+        }
+        if allIn { return tri }
         var poly = tri
         for plane in planes {
             if poly.isEmpty { break }
@@ -485,7 +710,7 @@ final class NovaGPU {
                 let curIn = dc >= 0, prevIn = dp >= 0
                 if curIn != prevIn {
                     let f = dp / (dp - dc)
-                    out.append(lerpVertex(prev, cur, f))
+                    out.append(lerpVertex(prev, cur, f, usedSlots: usedSlots))
                 }
                 if curIn { out.append(cur) }
             }
@@ -494,112 +719,147 @@ final class NovaGPU {
         return poly
     }
 
-    private static func lerpVertex(_ a: ShadedVertex, _ b: ShadedVertex, _ f: Float) -> ShadedVertex {
+    private static func lerpVertex(_ a: ShadedVertex, _ b: ShadedVertex, _ f: Float,
+                                   usedSlots: [Int]) -> ShadedVertex {
         var v = ShadedVertex()
         v.clip = (a.clip.0 + (b.clip.0 - a.clip.0) * f,
                   a.clip.1 + (b.clip.1 - a.clip.1) * f,
                   a.clip.2 + (b.clip.2 - a.clip.2) * f,
                   a.clip.3 + (b.clip.3 - a.clip.3) * f)
-        for s in 0..<8 {
-            for c in 0..<4 { v.varyings[s][c] = a.varyings[s][c] + (b.varyings[s][c] - a.varyings[s][c]) * f }
+        for s in usedSlots {
+            let o = s * 4
+            for c in 0..<4 { v.varyings[o + c] = a.varyings[o + c] + (b.varyings[o + c] - a.varyings[o + c]) * f }
         }
         return v
     }
 
     /// Rasterises one screen-space triangle into rows [y0, y1).
-    /// Fragments are shaded in warps of 32 along each row.
-    private func rasterise(_ tri: [ShadedVertex], width: Int, height: Int,
+    /// Fragments are shaded in warps of up to 32 along each row.
+    /// Coverage, barycentric weights, depth and interpolation use the
+    /// v1 expressions verbatim, evaluated per pixel in the same order.
+    private func rasterise(_ tri: WorkTri, width: Int,
                            y0: Int, y1: Int, depth: UnsafeMutablePointer<Float>,
-                           fb: UInt64, program: [UInt32], unis: [Float])
-        -> (ops: UInt64, frags: UInt64, warps: UInt64, touched: Bool) {
-        // Perspective divide + viewport.
-        func screen(_ v: ShadedVertex) -> (x: Float, y: Float, z: Float, invW: Float) {
-            let iw = 1 / v.clip.3
-            return ((v.clip.0 * iw * 0.5 + 0.5) * Float(width),
-                    (0.5 - v.clip.1 * iw * 0.5) * Float(height),
-                    v.clip.2 * iw, iw)
-        }
-        let s0 = screen(tri[0]), s1 = screen(tri[1]), s2 = screen(tri[2])
-        let area = (s1.x - s0.x) * (s2.y - s0.y) - (s1.y - s0.y) * (s2.x - s0.x)
-        if area == 0 { return (0, 0, 0, false) }
-        let minY = max(y0, Int(floorf(min(s0.y, min(s1.y, s2.y)))))
-        let maxY = min(y1 - 1, Int(ceilf(max(s0.y, max(s1.y, s2.y)))))
-        if minY > maxY { return (0, 0, 0, false) }
-        let minX = max(0, Int(floorf(min(s0.x, min(s1.x, s2.x)))))
-        let maxX = min(width - 1, Int(ceilf(max(s0.x, max(s1.x, s2.x)))))
-        if minX > maxX { return (0, 0, 0, false) }
+                           fbTable: UnsafeBufferPointer<UnsafeMutablePointer<UInt8>?>,
+                           fbFirstBlock: Int, fb: UInt64,
+                           decoded: DecodedShader, unis: [Float], usedSlots: [Int],
+                           warpPx: UnsafeMutablePointer<Int>,
+                           warpVar: UnsafeMutablePointer<Float>,
+                           warpCol: UnsafeMutablePointer<Float>)
+        -> (ops: UInt64, frags: UInt64, warps: UInt64) {
+        let s0 = tri.s0, s1 = tri.s1, s2 = tri.s2
+        let area = (s1.0 - s0.0) * (s2.1 - s0.1) - (s1.1 - s0.1) * (s2.0 - s0.0)
+        if area == 0 { return (0, 0, 0) }
+        let minY = max(y0, Int(floorf(min(s0.1, min(s1.1, s2.1)))))
+        let maxY = min(y1 - 1, Int(ceilf(max(s0.1, max(s1.1, s2.1)))))
+        if minY > maxY { return (0, 0, 0) }
+        let minX = max(0, Int(floorf(min(s0.0, min(s1.0, s2.0)))))
+        let maxX = min(width - 1, Int(ceilf(max(s0.0, max(s1.0, s2.0)))))
+        if minX > maxX { return (0, 0, 0) }
 
         var totalOps: UInt64 = 0
         var totalFrags: UInt64 = 0
         var totalWarps: UInt64 = 0
         let invArea = 1 / area
+        let tv0 = tri.v0, tv1 = tri.v1, tv2 = tri.v2
 
         for y in minY...maxY {
             let py = Float(y) + 0.5
             var x = minX
             while x <= maxX {
                 // Build one warp: up to 32 consecutive pixels in this row.
-                var lanesPx: [Int] = []
-                var lanesVar: [[[Float]]] = []   // per lane: varyings[8][4]
+                var laneCount = 0
                 var cursor = x
-                while cursor <= maxX && lanesPx.count < 32 {
+                while cursor <= maxX && laneCount < 32 {
                     let px = Float(cursor) + 0.5
-                    let e0 = (s2.x - s1.x) * (py - s1.y) - (s2.y - s1.y) * (px - s1.x)
-                    let e1 = (s0.x - s2.x) * (py - s2.y) - (s0.y - s2.y) * (px - s2.x)
-                    let e2 = (s1.x - s0.x) * (py - s0.y) - (s1.y - s0.y) * (px - s0.x)
+                    let e0 = (s2.0 - s1.0) * (py - s1.1) - (s2.1 - s1.1) * (px - s1.0)
+                    let e1 = (s0.0 - s2.0) * (py - s2.1) - (s0.1 - s2.1) * (px - s2.0)
+                    let e2 = (s1.0 - s0.0) * (py - s0.1) - (s1.1 - s0.1) * (px - s0.0)
                     let inside = (e0 >= 0 && e1 >= 0 && e2 >= 0) || (e0 <= 0 && e1 <= 0 && e2 <= 0)
                     if inside {
                         let w0 = e0 * invArea, w1 = e1 * invArea, w2 = e2 * invArea
-                        let z = w0 * s0.z + w1 * s1.z + w2 * s2.z
+                        let z = w0 * s0.2 + w1 * s1.2 + w2 * s2.2
                         let di = y * width + cursor
                         if z >= 0 && z >= depth[di] {
-                            // Perspective-correct varying interpolation.
-                            let iw = w0 * s0.invW + w1 * s1.invW + w2 * s2.invW
-                            var vary = [[Float]](repeating: [0, 0, 0, 0], count: 8)
+                            // Perspective-correct interpolation of the
+                            // slots the fragment program can read.
+                            let iw = w0 * s0.3 + w1 * s1.3 + w2 * s2.3
+                            let varBase = laneCount * 32
                             if iw != 0 {
-                                for s in 0..<8 { for c in 0..<4 {
-                                    vary[s][c] = (w0 * s0.invW * tri[0].varyings[s][c]
-                                                + w1 * s1.invW * tri[1].varyings[s][c]
-                                                + w2 * s2.invW * tri[2].varyings[s][c]) / iw
-                                } }
+                                for s in usedSlots {
+                                    let so = s * 4
+                                    for c in 0..<4 {
+                                        warpVar[varBase + so + c] =
+                                            (w0 * s0.3 * tv0.varyings[so + c]
+                                           + w1 * s1.3 * tv1.varyings[so + c]
+                                           + w2 * s2.3 * tv2.varyings[so + c]) / iw
+                                    }
+                                }
+                            } else {
+                                for s in usedSlots {
+                                    let so = s * 4
+                                    for c in 0..<4 { warpVar[varBase + so + c] = 0 }
+                                }
                             }
                             depth[di] = z
-                            lanesPx.append(di)
-                            lanesVar.append(vary)
+                            warpPx[laneCount] = di
+                            laneCount += 1
                         }
                     }
                     cursor += 1
                 }
-                if !lanesPx.isEmpty {
-                    var colours = [(Float, Float, Float, Float)](repeating: (0, 0, 0, 1), count: lanesPx.count)
+                if laneCount > 0 {
+                    // v1 default lane colour: (0, 0, 0, 1) when the
+                    // program never writes OUT 0.
+                    for i in 0..<laneCount {
+                        warpCol[i * 4] = 0; warpCol[i * 4 + 1] = 0
+                        warpCol[i * 4 + 2] = 0; warpCol[i * 4 + 3] = 1
+                    }
                     var ctx = WarpContext.dummy()
                     ctx.uniforms = unis
                     ctx.attrProvider = { lane, slot in
-                        let v = lanesVar[lane][slot]
-                        return (v[0], v[1], v[2], v[3])
+                        // Varyings exist for slots 0..7. (v1 indexed a
+                        // per-fragment array and trapped on slot >= 8;
+                        // no valid program reads those — there is no
+                        // OUT slot >= 8 into the fragment stage — so
+                        // zero is returned instead of a trap.)
+                        guard slot >= 0 && slot < 8 else { return (0, 0, 0, 0) }
+                        let o = lane * 32 + slot * 4
+                        return (warpVar[o], warpVar[o + 1], warpVar[o + 2], warpVar[o + 3])
                     }
                     ctx.texSampler = { [self] unit, u, v in self.sampleTexture(unit: unit, u: u, v: v) }
                     ctx.outWriter = { lane, slot, r, g, b, a in
-                        if slot == 0 { colours[lane] = (r, g, b, a) }
+                        if slot == 0 {
+                            let o = lane * 4
+                            warpCol[o] = r; warpCol[o + 1] = g
+                            warpCol[o + 2] = b; warpCol[o + 3] = a
+                        }
                     }
-                    totalOps += UInt64(ShaderExecutor.runWarp(program: program, lanes: lanesPx.count, ctx: ctx))
-                    totalFrags += UInt64(lanesPx.count)
+                    totalOps += UInt64(ShaderExecutor.runWarp(decoded: decoded, lanes: laneCount, ctx: ctx))
+                    totalFrags += UInt64(laneCount)
                     totalWarps += 1
                     // Lanes hold only the pixels that passed coverage +
                     // depth, so they are not guaranteed consecutive:
-                    // write each pixel at its own framebuffer offset.
-                    for i in 0..<lanesPx.count {
-                        let c = colours[i]
-                        let px: [UInt8] = [UInt8(min(max(c.0, 0), 1) * 255),
-                                           UInt8(min(max(c.1, 0), 1) * 255),
-                                           UInt8(min(max(c.2, 0), 1) * 255),
-                                           UInt8(min(max(c.3, 0), 1) * 255)]
-                        vramWrite(at: fb + UInt64(lanesPx[i] * 4), bytes: px)
+                    // write each pixel at its own framebuffer offset,
+                    // through the block table resolved for this draw.
+                    for i in 0..<laneCount {
+                        let co = i * 4
+                        let rb = UInt8(min(max(warpCol[co], 0), 1) * 255)
+                        let gb = UInt8(min(max(warpCol[co + 1], 0), 1) * 255)
+                        let bb = UInt8(min(max(warpCol[co + 2], 0), 1) * 255)
+                        let ab = UInt8(min(max(warpCol[co + 3], 0), 1) * 255)
+                        let byteAddr = fb + UInt64(warpPx[i] * 4)
+                        let tableIdx = Int(byteAddr >> 16) - fbFirstBlock
+                        if tableIdx >= 0 && tableIdx < fbTable.count, let p = fbTable[tableIdx] {
+                            let o = Int(byteAddr & 0xFFFF)
+                            p[o] = rb; p[o + 1] = gb; p[o + 2] = bb; p[o + 3] = ab
+                        } else {
+                            vramWrite(at: byteAddr, bytes: [rb, gb, bb, ab])
+                        }
                     }
                 }
                 x = cursor
             }
         }
-        return (totalOps, totalFrags, totalWarps, true)
+        return (totalOps, totalFrags, totalWarps)
     }
 }
