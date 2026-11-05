@@ -13,9 +13,16 @@ jobs:
         run: |
           python3 Driver/novas.py Driver/gpu_driver.nova -o Driver/gpu_driver.bin
           ls -l Driver/gpu_driver.bin
-      - name: Build bus host tests
+      - name: Build the C hot core (round 3)
         run: |
           mkdir -p build
+          # FP contract OFF and no fast-math: the C vector ops must
+          # stay bit-identical to IEEE-754 Swift arithmetic — the
+          # framebuffer checksums are the judge.
+          clang -O3 -ffp-contract=off -fno-fast-math -c \
+            Sources/NovaGPU/NovaGPUFast.c -o build/NovaGPUFast.o
+      - name: Build bus host tests
+        run: |
           swiftc -O -o build/hosttests \
             HostTests/main.swift \
             App/NovaGPUTest/NovaMemory.swift \
@@ -23,7 +30,8 @@ jobs:
             Sources/NovaGPU/NovaGPU.swift \
             Sources/NovaGPU/NovaBus.swift \
             Sources/NovaGPU/NovaBusClient.swift \
-            Sources/NovaGPU/NovaGPUStandard.swift
+            Sources/NovaGPU/NovaGPUStandard.swift \
+            build/NovaGPUFast.o
       - name: Run bus host tests
         run: |
           set -o pipefail
@@ -39,7 +47,8 @@ jobs:
             Sources/NovaGPU/NovaGPU.swift \
             Sources/NovaGPU/NovaBus.swift \
             Sources/NovaGPU/NovaBusClient.swift \
-            Sources/NovaGPU/NovaGPUStandard.swift
+            Sources/NovaGPU/NovaGPUStandard.swift \
+            build/NovaGPUFast.o
       - name: Run CPU proof
         run: |
           set -o pipefail

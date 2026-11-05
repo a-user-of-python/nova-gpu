@@ -153,6 +153,18 @@ struct ShaderBuilder {
 struct WarpContext {
     /// 16 uniform vec4s, flattened [idx*4 + comp].
     var uniforms: [Float]
+    /// Fragment-stage fast path (speed round 3): when set, LDATTR
+    /// reads varyings straight from this buffer — layout [lane][32]
+    /// floats, slot s component c at lane*32 + s*4 + c, slots 0..7 —
+    /// instead of calling attrProvider per lane. Bit-identical: the
+    /// buffer is exactly what the fragment attrProvider closure read.
+    var attrPtr: UnsafePointer<Float>? = nil
+    /// Fragment-stage fast path: when set, OUT 0 writes the lane
+    /// colour straight to this buffer — layout [lane][4] floats —
+    /// instead of calling outWriter per lane. Other OUT slots are
+    /// ignored, exactly as the fragment outWriter closure ignored
+    /// them.
+    var outPtr: UnsafeMutablePointer<Float>? = nil
     /// (lane, slot) -> vec4. Vertex: attributes. Fragment: varyings.
     /// Compute: slot 0 = (gid, 0, 0, 0).
     var attrProvider: (Int, Int) -> (Float, Float, Float, Float)
@@ -219,6 +231,30 @@ struct DecodedShader {
     }
 }
 
+// MARK: - C hot core bindings (speed round 3)
+//
+// The component-wise FP32 vector ops live in NovaGPUFast.c. The C
+// functions perform exactly the IEEE-754 operations the Swift vector
+// code performed (one rounding per op, no FMA fusion — see
+// NovaGPUFast.h), so results are bit-identical; the framebuffer
+// checksums police this on every CI run. Every build that compiles
+// these Swift sources also compiles and links NovaGPUFast.c.
+
+@_silgen_name("ngp_add_f32")
+private func ngp_add_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ n: Int32)
+@_silgen_name("ngp_sub_f32")
+private func ngp_sub_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ n: Int32)
+@_silgen_name("ngp_mul_f32")
+private func ngp_mul_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ n: Int32)
+@_silgen_name("ngp_div_f32")
+private func ngp_div_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ n: Int32)
+@_silgen_name("ngp_mad_f32")
+private func ngp_mad_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ n: Int32)
+@_silgen_name("ngp_rcp_f32")
+private func ngp_rcp_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ n: Int32)
+@_silgen_name("ngp_mov_f32")
+private func ngp_mov_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ n: Int32)
+
 // MARK: - Executor
 //
 // Speed round (v2): the v1 executor re-decoded every instruction from
@@ -258,36 +294,47 @@ enum ShaderExecutor {
     static func runWarp(decoded: DecodedShader, lanes: Int, ctx: WarpContext) -> Int {
         let n = max(0, min(warpSize, lanes))
         if n == 0 || decoded.count == 0 { return 0 }
-        return ctx.uniforms.withUnsafeBufferPointer { ubuf in
+        // Speed round 3: the decoded arrays are read through raw
+        // pointers for the whole warp — no bounds-checked array
+        // subscripts in the issue loop. Same values, same order.
+        return decoded.op.withUnsafeBufferPointer { opB in
+        decoded.d.withUnsafeBufferPointer { dB in
+        decoded.a.withUnsafeBufferPointer { aB in
+        decoded.b.withUnsafeBufferPointer { bB in
+        decoded.imm.withUnsafeBufferPointer { immB in
+        ctx.uniforms.withUnsafeBufferPointer { ubuf in
             withUnsafeTemporaryAllocation(of: SIMD4<Float>.self,
                                           capacity: regCount * warpSize) { vbuf in
                 vbuf.initialize(repeating: SIMD4<Float>())
                 let vb = vbuf.baseAddress!
                 let rp = UnsafeMutableRawPointer(vb).assumingMemoryBound(to: Float.self)
                 let up = UnsafeMutableRawPointer(vb).assumingMemoryBound(to: UInt32.self)
-                return runLoop(decoded: decoded, n: n, ctx: ctx,
-                               ubuf: ubuf, vb: vb, rp: rp, up: up)
+                return runLoop(opP: opB.baseAddress!, dP: dB.baseAddress!,
+                               aP: aB.baseAddress!, bP: bB.baseAddress!,
+                               immP: immB.baseAddress!, wc: decoded.count,
+                               n: n, ctx: ctx, ubuf: ubuf, vb: vb, rp: rp, up: up)
             }
-        }
+        }}}}}}
     }
 
-    private static func runLoop(decoded: DecodedShader, n: Int, ctx: WarpContext,
+    private static func runLoop(opP: UnsafePointer<UInt32>, dP: UnsafePointer<UInt32>,
+                                aP: UnsafePointer<UInt32>, bP: UnsafePointer<UInt32>,
+                                immP: UnsafePointer<UInt32>, wc: Int,
+                                n: Int, ctx: WarpContext,
                                 ubuf: UnsafeBufferPointer<Float>,
                                 vb: UnsafeMutablePointer<SIMD4<Float>>,
                                 rp: UnsafeMutablePointer<Float>,
                                 up: UnsafeMutablePointer<UInt32>) -> Int {
-        let opsA = decoded.op, dA = decoded.d, aA = decoded.a, bA = decoded.b, immA = decoded.imm
-        let wc = decoded.count
         var laneOps = 0
         var pc = 0
         var steps = 0
         let maxSteps = 100_000   // runaway-shader guard; a fault, not a hang
         while pc >= 0 && pc < wc && steps < maxSteps {
             steps += 1
-            let opc = opsA[pc]
-            let d = Int(dA[pc])
-            let a = Int(aA[pc])
-            let b = Int(bA[pc])
+            let opc = opP[pc]
+            let d = Int(dP[pc])
+            let a = Int(aP[pc])
+            let b = Int(bP[pc])
             var nextPc = pc + 1
             switch opc {
             case 0x52: // END — returns without counting itself (as v1)
@@ -304,7 +351,7 @@ enum ShaderExecutor {
                 }
             case 0x02: // MOVI — splat of the following word's FP32 bits
                 laneOps += n
-                let v = SIMD4<Float>(repeating: Float(bitPattern: immA[pc]))
+                let v = SIMD4<Float>(repeating: Float(bitPattern: immP[pc]))
                 let base = d * warpSize
                 for l in 0..<n { vb[base + l] = v }
                 nextPc = pc + 2
@@ -324,12 +371,12 @@ enum ShaderExecutor {
                                 up: UnsafeMutablePointer<UInt32>) {
         // Register bases: SIMD4 units for vector ops, Float units for
         // scalar ops. (reg * warpSize lanes; reg * 128 floats.)
-        let db = d * warpSize, ab = a * warpSize, bb = b * warpSize
+        let db = d * warpSize, ab = a * warpSize
         let df = d * 128, af = a * 128, bf = b * 128
         let span = n * 4
         switch opc {
-        case 0x01: // MOV
-            for l in 0..<n { vb[db + l] = vb[ab + l] }
+        case 0x01: // MOV — C core (component-wise copy, bit-exact)
+            ngp_mov_f32(rp + df, rp + af, Int32(span))
         case 0x03: // LDUNIF — warp-uniform value; guarded read done once
             let base = a * 4
             let v = SIMD4<Float>(base + 0 < ubuf.count ? ubuf[base + 0] : 0,
@@ -337,33 +384,55 @@ enum ShaderExecutor {
                                  base + 2 < ubuf.count ? ubuf[base + 2] : 0,
                                  base + 3 < ubuf.count ? ubuf[base + 3] : 0)
             for l in 0..<n { vb[db + l] = v }
-        case 0x04: // LDATTR
-            for l in 0..<n {
-                let v = ctx.attrProvider(l, a)
-                vb[db + l] = SIMD4<Float>(v.0, v.1, v.2, v.3)
+        case 0x04: // LDATTR — fragment fast path reads the varying
+            // buffer directly; same values the closure returned.
+            if let ap = ctx.attrPtr {
+                if a < 8 {
+                    for l in 0..<n {
+                        let o = l * 32 + a * 4
+                        vb[db + l] = SIMD4<Float>(ap[o], ap[o + 1], ap[o + 2], ap[o + 3])
+                    }
+                } else {
+                    for l in 0..<n { vb[db + l] = SIMD4<Float>() }
+                }
+            } else {
+                for l in 0..<n {
+                    let v = ctx.attrProvider(l, a)
+                    vb[db + l] = SIMD4<Float>(v.0, v.1, v.2, v.3)
+                }
             }
-        case 0x05: // OUT
-            for l in 0..<n {
-                let v = vb[ab + l]
-                ctx.outWriter(l, d, v.x, v.y, v.z, v.w)
+        case 0x05: // OUT — fragment fast path writes the colour buffer
+            // directly; only slot 0 is recorded there, as before.
+            if let op = ctx.outPtr {
+                if d == 0 {
+                    for l in 0..<n {
+                        let v = vb[ab + l]
+                        let o = l * 4
+                        op[o] = v.x; op[o + 1] = v.y; op[o + 2] = v.z; op[o + 3] = v.w
+                    }
+                }
+            } else {
+                for l in 0..<n {
+                    let v = vb[ab + l]
+                    ctx.outWriter(l, d, v.x, v.y, v.z, v.w)
+                }
             }
-        case 0x10: // ADD
-            for l in 0..<n { vb[db + l] = vb[ab + l] + vb[bb + l] }
-        case 0x11: // SUB
-            for l in 0..<n { vb[db + l] = vb[ab + l] - vb[bb + l] }
-        case 0x12: // MUL
-            for l in 0..<n { vb[db + l] = vb[ab + l] * vb[bb + l] }
-        case 0x13: // DIV
-            for l in 0..<n { vb[db + l] = vb[ab + l] / vb[bb + l] }
+        case 0x10: // ADD — C core (IEEE per component, bit-exact)
+            ngp_add_f32(rp + df, rp + af, rp + bf, Int32(span))
+        case 0x11: // SUB — C core
+            ngp_sub_f32(rp + df, rp + af, rp + bf, Int32(span))
+        case 0x12: // MUL — C core
+            ngp_mul_f32(rp + df, rp + af, rp + bf, Int32(span))
+        case 0x13: // DIV — C core
+            ngp_div_f32(rp + df, rp + af, rp + bf, Int32(span))
         case 0x14: // MIN — Swift.min per component (v1 expression)
             for i in 0..<span { rp[df + i] = Swift.min(rp[af + i], rp[bf + i]) }
         case 0x15: // MAX — Swift.max per component (v1 expression)
             for i in 0..<span { rp[df + i] = Swift.max(rp[af + i], rp[bf + i]) }
-        case 0x16: // MAD — rd = ra * rb + rd (two ops, no fusion, as v1)
-            for l in 0..<n { vb[db + l] = vb[ab + l] * vb[bb + l] + vb[db + l] }
-        case 0x17: // RCP
-            let one = SIMD4<Float>(repeating: 1)
-            for l in 0..<n { vb[db + l] = one / vb[ab + l] }
+        case 0x16: // MAD — rd = ra * rb + rd (two roundings, no fusion, as v1) — C core
+            ngp_mad_f32(rp + df, rp + af, rp + bf, Int32(span))
+        case 0x17: // RCP — C core (1 / x per component)
+            ngp_rcp_f32(rp + df, rp + af, Int32(span))
         case 0x18: // SQRT — v1: x <= 0 ? 0 : sqrtf(x)
             for i in 0..<span { let x = rp[af + i]; rp[df + i] = x <= 0 ? 0 : sqrtf(x) }
         case 0x19: // RSQ — v1: x <= 0 ? 0 : 1 / sqrtf(x)

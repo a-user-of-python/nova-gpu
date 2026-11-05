@@ -54,6 +54,16 @@ final class GPUEngine: ObservableObject {
             try client.setShader(.setVShader, programHandle: sh, off: 0, len: vs.count * 4)
             try client.setShader(.setFShader, programHandle: sh, off: 4096, len: fs.count * 4)
             try client.setFBuf(fb, fbW, fbH)
+            // Round 3: the constant lit uniforms — mask rows 4–7,
+            // light row 8, ones row 9 — are sent ONCE here. Frames
+            // update only the MVP rows 0–3; v2 resent all ten rows
+            // per object per frame (12 wasted round trips a frame).
+            try client.setUniform(4, (1, 0, 0, 0))
+            try client.setUniform(5, (0, 1, 0, 0))
+            try client.setUniform(6, (0, 0, 1, 0))
+            try client.setUniform(7, (0, 0, 0, 1))
+            try client.setUniform(8, (0.577, 0.577, 0.577, 0))
+            try client.setUniform(9, (1, 1, 1, 1))
             sphereV = try client.alloc(UInt64(sphere.vertices.count * 4))
             sphereI = try client.alloc(UInt64(sphere.indices.count * 4))
             try client.uploadData(sphereV, data: NovaGPUStandard.vertexBytes(sphere), guestStaging: STAGE)
@@ -87,32 +97,50 @@ final class GPUEngine: ObservableObject {
         do {
             angle += 0.02
             let proj = NovaGPUStandard.matPerspective(k: 0.45)
-            try client.clear(0xFF200810)
-            var mvp = NovaGPUStandard.matMul(proj, NovaGPUStandard.matMul(
+            let mvpSphere = NovaGPUStandard.matMul(proj, NovaGPUStandard.matMul(
                 NovaGPUStandard.matRotX(0.5),
                 NovaGPUStandard.matMul(NovaGPUStandard.matRotY(angle), NovaGPUStandard.matScale(0.72))))
-            try NovaGPUStandard.setLitUniforms(client, mvp: mvp)
-            try client.setVBuf(sphereV); try client.setIBuf(sphereI)
-            try client.draw(indexCount: sphereIdx)
-            mvp = NovaGPUStandard.matMul(proj, NovaGPUStandard.matMul(
+            let mvpTorus = NovaGPUStandard.matMul(proj, NovaGPUStandard.matMul(
                 NovaGPUStandard.matTranslate(-0.05, -0.1, 0.35),
                 NovaGPUStandard.matMul(NovaGPUStandard.matRotX(1.1),
                                        NovaGPUStandard.matMul(NovaGPUStandard.matRotY(angle * 0.6),
                                                               NovaGPUStandard.matScale(0.62)))))
-            try NovaGPUStandard.setLitUniforms(client, mvp: mvp)
-            try client.setVBuf(torusV); try client.setIBuf(torusI)
-            try client.draw(indexCount: torusIdx)
-            try client.present(fb)
+            // Round 3: the whole frame is ONE batch — 14 descriptors,
+            // one doorbell write, one device drain. v2 paid a full
+            // descriptor round trip (write, doorbell MMIO, drain,
+            // status poll) for each of its ~15 frame commands, on
+            // top of the six per-object uniform resends now avoided.
+            var batch: [(opcode: GPUCommand, fence: UInt64, args: [UInt64])] = []
+            batch.append((opcode: .clear, fence: 0, args: [UInt64(0xFF200810), 0, 0, 0, 0]))
+            appendMVP(&batch, mvpSphere)
+            batch.append((opcode: .setVBuf, fence: 0, args: [sphereV, 0, 0, 0, 0]))
+            batch.append((opcode: .setIBuf, fence: 0, args: [sphereI, 0, 0, 0, 0]))
+            batch.append((opcode: .draw, fence: 0, args: [UInt64(sphereIdx), 0, 0, 0, 0]))
+            appendMVP(&batch, mvpTorus)
+            batch.append((opcode: .setVBuf, fence: 0, args: [torusV, 0, 0, 0, 0]))
+            batch.append((opcode: .setIBuf, fence: 0, args: [torusI, 0, 0, 0, 0]))
+            batch.append((opcode: .draw, fence: 0, args: [UInt64(torusIdx), 0, 0, 0, 0]))
+            batch.append((opcode: .present, fence: 0, args: [fb, 0, 0, 0, 0]))
+            try client.submitBatch(batch)
             let px = try client.downloadData(fb, len: fbW * fbH * 4, guestStaging: DSTAGE)
             let img = makeImage(px)
             frameCount += 1
-            var colours = distinctColours
+            // Round 3: the distinct-colour census (a Set build over
+            // 307,200 pixels — ~6 ms on the hosted bench) ran on
+            // THIS queue every 20th frame in v2: a periodic hitch
+            // inside the frame time being measured. It now runs on
+            // a utility queue over the already-downloaded bytes and
+            // publishes when done; the displayed count trails by one
+            // census period.
             if frameCount % 20 == 0 {
-                var set = Set<UInt32>()
-                for i in stride(from: 0, to: px.count, by: 4) {
-                    set.insert(UInt32(px[i]) | (UInt32(px[i + 1]) << 8) | (UInt32(px[i + 2]) << 16) | (UInt32(px[i + 3]) << 24))
+                DispatchQueue.global(qos: .utility).async { [weak self] in
+                    var set = Set<UInt32>()
+                    for i in stride(from: 0, to: px.count, by: 4) {
+                        set.insert(UInt32(px[i]) | (UInt32(px[i + 1]) << 8) | (UInt32(px[i + 2]) << 16) | (UInt32(px[i + 3]) << 24))
+                    }
+                    let n = set.count
+                    DispatchQueue.main.async { self?.distinctColours = n }
                 }
-                colours = set.count
             }
             let now = Date()
             let dt = now.timeIntervalSince(lastTick)
@@ -125,20 +153,52 @@ final class GPUEngine: ObservableObject {
                 if dt > 0 { self.fps = self.fps * 0.8 + (1 / dt) * 0.2 }
                 self.cusActive = stats.activeComputeUnits
                 self.vramUsedKiB = Int(self.device.gpu.vramReserved / 1024)
-                self.distinctColours = colours
             }
         } catch {
             DispatchQueue.main.async { self.statusLine = "frame failed: \(error)" }
         }
     }
 
+    /// Appends the four setUniform descriptors for an MVP's rows
+    /// 0–3 — the only uniforms that change per frame.
+    private func appendMVP(_ batch: inout [(opcode: GPUCommand, fence: UInt64, args: [UInt64])], _ mvp: [Float]) {
+        for r in 0..<4 {
+            batch.append((opcode: .setUniform, fence: 0,
+                          args: [UInt64(r),
+                                 UInt64(mvp[r * 4].bitPattern), UInt64(mvp[r * 4 + 1].bitPattern),
+                                 UInt64(mvp[r * 4 + 2].bitPattern), UInt64(mvp[r * 4 + 3].bitPattern)]))
+        }
+    }
+
+    // Round 3: persistent double-buffered image storage. v2 built a
+    // fresh Data copy and CGDataProvider for every frame; the two
+    // buffers here alternate, so the provider backing the published
+    // image is never the one being filled.
+    private var imageBuffers: [NSMutableData] = []
+    private var imageProviders: [CGDataProvider] = []
+    private var imageFlip = 0
+
     private func makeImage(_ px: [UInt8]) -> CGImage? {
+        let n = fbW * fbH * 4
+        if imageBuffers.isEmpty {
+            for _ in 0..<2 {
+                let d = NSMutableData(length: n)!
+                imageBuffers.append(d)
+                if let p = CGDataProvider(data: d as CFData) { imageProviders.append(p) }
+            }
+            if imageProviders.count != 2 { return nil }
+        }
+        imageFlip = 1 - imageFlip
+        px.withUnsafeBytes { src in
+            if let base = src.baseAddress {
+                imageBuffers[imageFlip].replaceBytes(in: NSRange(location: 0, length: n), withBytes: base)
+            }
+        }
         let cs = CGColorSpaceCreateDeviceRGB()
         let info = CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue)
-        guard let provider = CGDataProvider(data: Data(px) as CFData) else { return nil }
         return CGImage(width: fbW, height: fbH, bitsPerComponent: 8, bitsPerPixel: 32,
                        bytesPerRow: fbW * 4, space: cs, bitmapInfo: info,
-                       provider: provider, decode: nil, shouldInterpolate: false,
+                       provider: imageProviders[imageFlip], decode: nil, shouldInterpolate: false,
                        intent: .defaultIntent)
     }
 }

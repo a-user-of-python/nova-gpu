@@ -89,6 +89,61 @@ final class NovaBusClient {
         throw BusClientError.timeout
     }
 
+    /// Speed round 3: submits several descriptors with ONE doorbell
+    /// write and ONE device drain. Semantically identical to calling
+    /// submit() for each in order — the device consumes the ring in
+    /// order either way — but the per-command round trip (descriptor
+    /// write, doorbell MMIO write, drain call, status poll) is paid
+    /// once per batch instead of once per command. Returns the
+    /// completed descriptors in submission order. Batches larger
+    /// than the ring fall back to sequential submits.
+    @discardableResult
+    func submitBatch(_ commands: [(opcode: GPUCommand, fence: UInt64, args: [UInt64])]) throws -> [GPUDescriptor] {
+        if commands.isEmpty { return [] }
+        if commands.count > Int(ringSlots) {
+            var out: [GPUDescriptor] = []
+            for cmd in commands {
+                out.append(try submit(opcode: cmd.opcode, fence: cmd.fence, args: cmd.args))
+            }
+            return out
+        }
+        var addrs: [UInt64] = []
+        addrs.reserveCapacity(commands.count)
+        for cmd in commands {
+            let slot = tail % ringSlots
+            let addr = ringBase + slot * UInt64(GPUDescriptor.byteSize)
+            let desc = GPUDescriptor(opcode: cmd.opcode.rawValue, fence: cmd.fence, args: cmd.args, status: 0)
+            memory.storeHostBytes(desc.packed(), at: addr)
+            tail += 1
+            addrs.append(addr)
+        }
+        writeReg(.doorbell, tail)
+        device.servicePendingWork()
+        var results: [GPUDescriptor] = []
+        results.reserveCapacity(commands.count)
+        let deadline = Date().addingTimeInterval(120)
+        for addr in addrs {
+            while true {
+                let bytes = memory.loadHostBytes(from: addr, count: GPUDescriptor.byteSize)
+                let desc = GPUDescriptor.unpack(bytes)
+                if desc.status == GPUDescriptorStatus.done.rawValue {
+                    results.append(desc)
+                    break
+                }
+                if desc.status == GPUDescriptorStatus.error.rawValue {
+                    throw BusClientError.deviceError(readReg(.error))
+                }
+                if desc.status == GPUDescriptorStatus.waitingService.rawValue {
+                    try servicePendingRequest()
+                    continue
+                }
+                if Date() >= deadline { throw BusClientError.timeout }
+                Thread.sleep(forTimeInterval: 0.0002)
+            }
+        }
+        return results
+    }
+
     private func servicePendingRequest() throws {
         let seq = readReg(.reqPending)
         guard seq != 0 else { return }
