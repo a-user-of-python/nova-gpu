@@ -726,20 +726,40 @@ final class NovaGPU {
                     (0.5 - v.clip.1 * iw * 0.5) * Float(height),
                     v.clip.2 * iw, iw)
         }
+        // Speed round 3: the clip runs over contiguous triangle
+        // ranges on all cores — it was the draw's serial tail (the
+        // vertex and raster stages already fan out). Each range
+        // builds its own work list; the lists are concatenated in
+        // range order, so the merged list is element-for-element the
+        // serial list: triangle order, and therefore depth-tie
+        // behaviour, is unchanged.
+        let triCount = idxCount >= 3 ? (idxCount - 3) / 3 + 1 : 0
+        final class WorkBox { var tris: [WorkTri] = [] }
+        let rangeCount = min(32, max(triCount, 1))
+        let boxes = (0..<rangeCount).map { _ in WorkBox() }
+        DispatchQueue.concurrentPerform(iterations: rangeCount) { range in
+            let lo = triCount * range / rangeCount
+            let hi = triCount * (range + 1) / rangeCount
+            var local: [WorkTri] = []
+            local.reserveCapacity(max(hi - lo, 0))
+            for k in lo..<hi {
+                let t = k * 3
+                let tri = [shadedPtr[Int(ibWords[t])],
+                           shadedPtr[Int(ibWords[t + 1])],
+                           shadedPtr[Int(ibWords[t + 2])]]
+                let clipped = Self.clipTriangle(tri, usedSlots: usedSlots)
+                if clipped.count < 3 { continue }
+                for fan in 1..<(clipped.count - 1) {
+                    let a = clipped[0], b = clipped[fan], c = clipped[fan + 1]
+                    local.append(WorkTri(v0: a, v1: b, v2: c,
+                                         s0: screenOf(a), s1: screenOf(b), s2: screenOf(c)))
+                }
+            }
+            boxes[range].tris = local
+        }
         var work: [WorkTri] = []
         work.reserveCapacity(idxCount / 3)
-        for t in stride(from: 0, to: idxCount - 2, by: 3) {
-            let tri = [shadedPtr[Int(ibWords[t])],
-                       shadedPtr[Int(ibWords[t + 1])],
-                       shadedPtr[Int(ibWords[t + 2])]]
-            let clipped = Self.clipTriangle(tri, usedSlots: usedSlots)
-            if clipped.count < 3 { continue }
-            for fan in 1..<(clipped.count - 1) {
-                let a = clipped[0], b = clipped[fan], c = clipped[fan + 1]
-                work.append(WorkTri(v0: a, v1: b, v2: c,
-                                    s0: screenOf(a), s1: screenOf(b), s2: screenOf(c)))
-            }
-        }
+        for box in boxes { work.append(contentsOf: box.tris) }
         stats.trianglesOut += UInt64(work.count)
 
         // ---- Rasterise in horizontal row chunks over the clusters.
