@@ -161,6 +161,14 @@ final class NovaBusClient {
 
     // MARK: - Convenience wrappers (one descriptor each)
 
+    /// v6 governor chip control over the ring (opcode 21):
+    /// action 1 = enable, 2 = disable, 3 = tick with a frame-work
+    /// time in microseconds. The chip also ticks on every PRESENT
+    /// when attached; this is the explicit channel.
+    func governorControl(_ action: UInt64, tickUs: UInt64 = 0) throws {
+        _ = try submit(opcode: .governorCmd, args: [action, tickUs, 0, 0, 0])
+    }
+
     func alloc(_ size: UInt64) throws -> UInt64 {
         let d = try submit(opcode: .alloc, args: [size, 0, 0, 0, 0])
         return d.args[0]
