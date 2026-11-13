@@ -164,6 +164,9 @@ private final class FragBatcher {
     let fbFirstBlock: Int
     let fb: UInt64
     let fbFallback: (UInt64, [UInt8]) -> Void
+    /// Lane indices the C writeback could not place (v5); replayed
+    /// through writePixel below. Capacity = one warp.
+    let skipBuf: UnsafeMutablePointer<Int32>
     var count = 0
     var ops: UInt64 = 0
     var frags: UInt64 = 0
@@ -180,6 +183,7 @@ private final class FragBatcher {
         self.decoded = decoded
         self.fbTable = fbTable; self.fbFirstBlock = fbFirstBlock; self.fb = fb
         self.fbFallback = fbFallback
+        self.skipBuf = UnsafeMutablePointer<Int32>.allocate(capacity: ShaderExecutor.warpSize)
         var c = WarpContext.dummy()
         c.uniforms = unis
         // The executor reads varyings and writes colours through
@@ -207,6 +211,28 @@ private final class FragBatcher {
         self.ctx = c
     }
 
+    deinit { skipBuf.deallocate() }
+
+    /// One pixel's conversion + write, in the original v1 form:
+    /// RGBA8888 bytes through the block table resolved for this
+    /// draw, or the locked fallback (which commits the block).
+    /// Used for the lanes the C writeback reports as skipped.
+    private func writePixel(_ i: Int) {
+        let co = i * 4
+        let rb = UInt8(min(max(col[co], 0), 1) * 255)
+        let gb = UInt8(min(max(col[co + 1], 0), 1) * 255)
+        let bb = UInt8(min(max(col[co + 2], 0), 1) * 255)
+        let ab = UInt8(min(max(col[co + 3], 0), 1) * 255)
+        let byteAddr = fb + UInt64(px[i] * 4)
+        let tableIdx = Int(byteAddr >> 16) - fbFirstBlock
+        if tableIdx >= 0 && tableIdx < fbTable.count, let p = fbTable[tableIdx] {
+            let o = Int(byteAddr & 0xFFFF)
+            p[o] = rb; p[o + 1] = gb; p[o + 2] = bb; p[o + 3] = ab
+        } else {
+            fbFallback(byteAddr, [rb, gb, bb, ab])
+        }
+    }
+
     /// Shades the accumulated lanes and writes their pixels out, in
     /// acceptance order. Called when the warp fills and once at the
     /// end of each chunk.
@@ -224,23 +250,21 @@ private final class FragBatcher {
         frags += UInt64(count)
         warps += 1
         // Lanes hold only the pixels that passed coverage + depth,
-        // so they are not guaranteed consecutive: write each pixel at
-        // its own framebuffer offset, through the block table
-        // resolved for this draw.
-        for i in 0..<count {
-            let co = i * 4
-            let rb = UInt8(min(max(col[co], 0), 1) * 255)
-            let gb = UInt8(min(max(col[co + 1], 0), 1) * 255)
-            let bb = UInt8(min(max(col[co + 2], 0), 1) * 255)
-            let ab = UInt8(min(max(col[co + 3], 0), 1) * 255)
-            let byteAddr = fb + UInt64(px[i] * 4)
-            let tableIdx = Int(byteAddr >> 16) - fbFirstBlock
-            if tableIdx >= 0 && tableIdx < fbTable.count, let p = fbTable[tableIdx] {
-                let o = Int(byteAddr & 0xFFFF)
-                p[o] = rb; p[o + 1] = gb; p[o + 2] = bb; p[o + 3] = ab
-            } else {
-                fbFallback(byteAddr, [rb, gb, bb, ab])
-            }
+        // so they are not guaranteed consecutive: each pixel is
+        // written at its own framebuffer offset. v5: conversion +
+        // writeback run in the C core (ngp_flush_writeback —
+        // identical per-channel expressions and table rule); the
+        // lanes it cannot place (uncommitted block / outside the
+        // table) come back as indices and are replayed through
+        // writePixel, whose locked fallback commits the block —
+        // the same bytes land either way.
+        if let tableBase = fbTable.baseAddress {
+            let skips = ngp_flush_writeback(col, px, Int32(count),
+                                             tableBase, Int32(fbTable.count),
+                                             fb, Int32(fbFirstBlock), skipBuf)
+            for s in 0..<Int(skips) { writePixel(Int(skipBuf[s])) }
+        } else {
+            for i in 0..<count { writePixel(i) }
         }
         count = 0
     }
