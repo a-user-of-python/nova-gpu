@@ -74,89 +74,142 @@ do {
     check(false, "client reference render", "\(error)")
 }
 
-// MARK: - Boot the real NovaCPU on the assembly driver
+// MARK: - Boot the real NovaCPU on the assembly driver (twice in v6)
+//
+// v6 runs the driver twice: once with the v5 fixed 100k-step
+// slices, once with the supervisor chip steering the slice size
+// (SET_CPU_SLICE, steered by each slice's measured wall time).
+// The full check battery applies to BOTH runs — the governor
+// changes scheduling only, never the result.
 
-let memory = NovaMemory(totalSize: 64 * 1024 * 1024)
-let cpu = NovaCPU()
-cpu.memory = memory
-let gpuDevice = NovaGPUDevice()
-gpuDevice.attach(to: memory)
-
-var consoleText = ""
-memory.consoleOutput = { s in consoleText += s }
-memory.netHandler = { _, _, _, _ in -1 }
-var trapDesc: String? = nil
-cpu.trapHandler = { trap, _ in
-    trapDesc = "\(trap)"
-    cpu.running = false
+struct DriverRun {
+    var console: String
+    var wallSeconds: Double
+    var descriptors: UInt64
+    var slices: Int
+    var trap: String?
+    var governorActions: [String]
 }
 
-// Loader role (like the harness loading a program): a small header
-// (u64 vs length, u64 fs length) at 0x22000, the shader binaries at
-// 0x22010 / 0x22800, and the cube indices at 0x23000. The vertex data
-// is deliberately NOT provided — the driver must produce it when the
-// GPU asks (that is the two-way proof).
-do {
-    var header = [UInt8](repeating: 0, count: 16)
-    let vsLen = UInt64(vsProg.count * 4), fsLen = UInt64(fsProg.count * 4)
-    for k in 0..<8 {
-        header[k] = UInt8((vsLen >> UInt64(k * 8)) & 0xFF)
-        header[8 + k] = UInt8((fsLen >> UInt64(k * 8)) & 0xFF)
+func runDriver(governed: Bool) -> DriverRun {
+    let memory = NovaMemory(totalSize: 64 * 1024 * 1024)
+    let cpu = NovaCPU()
+    cpu.memory = memory
+    let gpuDevice = NovaGPUDevice()
+    gpuDevice.attach(to: memory)
+    var gov: NovaGovernorDevice? = nil
+    if governed {
+        let g = NovaGovernorDevice()
+        g.attach(to: memory)
+        g.supervise(gpuDevice)
+        gpuDevice.governor = g
+        g.chip.setEnabled(true)
+        gov = g
     }
-    try memory.loadBytes(Data(header), at: 0x22000)
-    try memory.loadBytes(Data(NovaGPUStandard.programBytes(vsProg)), at: 0x22010)
-    try memory.loadBytes(Data(NovaGPUStandard.programBytes(fsProg)), at: 0x22800)
-    try memory.loadBytes(Data(NovaGPUStandard.indexBytes(cube)), at: 0x23000)
-    try memory.loadBytes(driverBin, at: 0)
-} catch {
-    check(false, "loading guest memory", "\(error)")
+
+    var consoleText = ""
+    memory.consoleOutput = { s in consoleText += s }
+    memory.netHandler = { _, _, _, _ in -1 }
+    var trapDesc: String? = nil
+    cpu.trapHandler = { trap, _ in
+        trapDesc = "\(trap)"
+        cpu.running = false
+    }
+
+    // Loader role (like the harness loading a program): a small
+    // header (u64 vs length, u64 fs length) at 0x22000, the shader
+    // binaries at 0x22010 / 0x22800, and the cube indices at
+    // 0x23000. The vertex data is deliberately NOT provided — the
+    // driver must produce it when the GPU asks (the two-way proof).
+    do {
+        var header = [UInt8](repeating: 0, count: 16)
+        let vsLen = UInt64(vsProg.count * 4), fsLen = UInt64(fsProg.count * 4)
+        for k in 0..<8 {
+            header[k] = UInt8((vsLen >> UInt64(k * 8)) & 0xFF)
+            header[8 + k] = UInt8((fsLen >> UInt64(k * 8)) & 0xFF)
+        }
+        try memory.loadBytes(Data(header), at: 0x22000)
+        try memory.loadBytes(Data(NovaGPUStandard.programBytes(vsProg)), at: 0x22010)
+        try memory.loadBytes(Data(NovaGPUStandard.programBytes(fsProg)), at: 0x22800)
+        try memory.loadBytes(Data(NovaGPUStandard.indexBytes(cube)), at: 0x23000)
+        try memory.loadBytes(driverBin, at: 0)
+    } catch {
+        check(false, "loading guest memory", "\(error)")
+    }
+
+    // resetCPUState, mirroring NovaVMEngine via the project harness.
+    cpu.dsp = memory.dataStackBase
+    cpu.csp = memory.callStackBase
+    cpu.vsp = memory.vectorStackBase
+    cpu.esp = memory.vectorStackBase &- 1024 * 1024
+    cpu.dslim = memory.dataStackBase &- 8 * 1024 * 1024
+    cpu.cslim = memory.callStackBase &- 8 * 1024 * 1024
+    cpu.eslim = cpu.esp &- 1024 * 1024
+    cpu.vslim = memory.vectorStackBase &- 8 * 1024 * 1024
+    cpu.fp = 0
+    cpu.pc = 0
+    cpu.status = (3 << 2) | 1
+    memory.timerInterval = 0
+    memory.timerCount = 0
+
+    let t0 = Date()
+    // Run in slices, servicing the GPU between slices: while the
+    // CPU executes, NovaMemory's RAM buffer is under a modify
+    // access, so the device does its DMA at these service points
+    // (see NovaBus.swift).
+    var budget: UInt64 = 0
+    var slices = 0
+    if let gov = gov {
+        repeat {
+            let slice = gov.chip.cpuSliceSteps
+            let s0 = Date()
+            cpu.run(maxSteps: Int(slice))
+            let sliceMs = Date().timeIntervalSince(s0) * 1000
+            budget += slice
+            slices += 1
+            gpuDevice.servicePendingWork()
+            gov.chip.tickCPU(sliceMs: sliceMs, steps: slice)
+        } while cpu.running && budget < 200_000_000
+    } else {
+        repeat {
+            cpu.run(maxSteps: 100_000)
+            budget += 100_000
+            slices += 1
+            gpuDevice.servicePendingWork()
+        } while cpu.running && budget < 200_000_000
+    }
+    let dt = Date().timeIntervalSince(t0)
+    return DriverRun(console: consoleText, wallSeconds: dt,
+                     descriptors: gpuDevice.descriptorsExecuted,
+                     slices: slices, trap: trapDesc,
+                     governorActions: gov?.chip.actionLog.map { $0.text } ?? [])
 }
 
-// resetCPUState, mirroring NovaVMEngine via the project harness.
-cpu.dsp = memory.dataStackBase
-cpu.csp = memory.callStackBase
-cpu.vsp = memory.vectorStackBase
-cpu.esp = memory.vectorStackBase &- 1024 * 1024
-cpu.dslim = memory.dataStackBase &- 8 * 1024 * 1024
-cpu.cslim = memory.callStackBase &- 8 * 1024 * 1024
-cpu.eslim = cpu.esp &- 1024 * 1024
-cpu.vslim = memory.vectorStackBase &- 8 * 1024 * 1024
-cpu.fp = 0
-cpu.pc = 0
-cpu.status = (3 << 2) | 1
-memory.timerInterval = 0
-memory.timerCount = 0
-
-let t0 = Date()
-// Run in slices, servicing the GPU between slices: while the CPU
-// executes, NovaMemory's RAM buffer is under a modify access, so the
-// device does its DMA at these service points (see NovaBus.swift).
-var budget: UInt64 = 0
-repeat {
-    cpu.run(maxSteps: 100_000)
-    budget += 100_000
-    gpuDevice.servicePendingWork()
-} while cpu.running && budget < 200_000_000
-let dt = Date().timeIntervalSince(t0)
-print("  .. driver run finished in \(String(format: "%.2f", dt)) s (CI host), trap: \(trapDesc ?? "none (WFI halt)")")
-print("  .. guest console output:")
-for line in consoleText.split(separator: "\n") { print("     | \(line)") }
-
-check(consoleText.contains("GPU OK"), "driver printed GPU OK")
-check(gpuDevice.descriptorsExecuted >= 20, "driver submitted a real command stream",
-      "\(gpuDevice.descriptorsExecuted) descriptors executed")
-
-var driverSum: UInt64? = nil
-for line in consoleText.split(separator: "\n") {
-    if line.hasPrefix("GPUFB ") {
+func checkRun(_ r: DriverRun, _ label: String) {
+    print("  .. \(label) run finished in \(String(format: "%.2f", r.wallSeconds)) s (CI host), \(r.slices) slices, trap: \(r.trap ?? "none (WFI halt)")")
+    print("  .. guest console output:")
+    for line in r.console.split(separator: "\n") { print("     | \(line)") }
+    check(r.console.contains("GPU OK"), "\(label): driver printed GPU OK")
+    check(r.descriptors >= 20, "\(label): driver submitted a real command stream",
+          "\(r.descriptors) descriptors executed")
+    var driverSum: UInt64? = nil
+    for line in r.console.split(separator: "\n") where line.hasPrefix("GPUFB ") {
         driverSum = UInt64(line.dropFirst(6).trimmingCharacters(in: .whitespaces))
     }
+    check(driverSum != nil, "\(label): driver printed the framebuffer checksum (GPUFB)")
+    if let ds = driverSum {
+        check(ds == expectedSum, "\(label): CPU-driven GPU framebuffer matches client-rendered framebuffer",
+              "driver \(ds) vs expected \(expectedSum)")
+    }
 }
-check(driverSum != nil, "driver printed the framebuffer checksum (GPUFB)")
-if let ds = driverSum {
-    check(ds == expectedSum, "CPU-driven GPU framebuffer matches client-rendered framebuffer",
-          "driver \(ds) vs expected \(expectedSum)")
-}
+
+let fixedRun = runDriver(governed: false)
+checkRun(fixedRun, "fixed 100k slices (v5 baseline)")
+let govRun = runDriver(governed: true)
+checkRun(govRun, "governor-supervised slices")
+print("  .. governor actions during the supervised run:")
+for a in govRun.governorActions { print("     | \(a)") }
+print("  .. wall time: fixed \(String(format: "%.2f", fixedRun.wallSeconds)) s vs governor \(String(format: "%.2f", govRun.wallSeconds)) s (CI host)")
 
 print(failures == 0 ? "\nCPU PROOF PASSED" : "\n\(failures) CPU PROOF CHECK(S) FAILED")
 exit(failures == 0 ? 0 : 1)
