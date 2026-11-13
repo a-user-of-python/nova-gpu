@@ -413,6 +413,8 @@ do {
 
 // MARK: 9. v4 vector hardware: VPU, plot unit, screen grid
 do {
+    check(NovaGPU.maxScreenVectors == 65536 && NovaGPU.vpuCount == 131072,
+          "vector hardware sizing: MAX_SCREEN_VECTORS 65,536 -> VPU_COUNT 131,072")
     // 9a. VPU.position is bit-identical to the shader stage's
     // VMAT4 on the same triangle workload (both are ngp_mat4, but
     // prove the VPU's load/axes plumbing preserves it).

@@ -214,13 +214,20 @@ final class NovaGPU {
     static var clusterCount = 48
     static let lanesPerCluster = 32
     static var computeUnits: Int { clusterCount * lanesPerCluster }   // 1536 at default
-    /// v4 vector hardware sizing. MAX_SCREEN_VECTORS is the plot
-    /// unit's per-frame on-screen vector budget — a placeholder
-    /// (4096) until Sean fixes the on-screen vector number; change
-    /// it here, in exactly one place. The VPU pool is sized at
-    /// 2 × that budget (double-capacity headroom).
-    static let maxScreenVectors = 4096       // MAX_SCREEN_VECTORS
-    static var vpuCount: Int { 2 * maxScreenVectors }   // VPU_COUNT = 8192
+    /// v4 vector hardware sizing (Sean, 2026-11-13). MAX_SCREEN_
+    /// VECTORS is the plot unit's per-frame on-screen vector
+    /// budget: 65,536. The VPU pool is sized at 2 × that budget
+    /// (double-capacity headroom): VPU_COUNT = 131,072.
+    ///
+    /// The pool is VIRTUAL: a VPU is a stateless 48-byte work slot
+    /// (one triangle's 9 axis values + w), not a persistent object
+    /// — slots are demand-allocated on the stack of whichever host
+    /// thread runs the workload and scheduled onto the host's real
+    /// threads, so the full 131,072-way addressable capacity costs
+    /// zero idle memory and zero scheduling overhead. The triangle
+    /// pipeline never touches the pool.
+    static let maxScreenVectors = 65536      // MAX_SCREEN_VECTORS
+    static var vpuCount: Int { 2 * maxScreenVectors }   // VPU_COUNT = 131,072
     static let vramSize: UInt64 = 2 * 1024 * 1024 * 1024       // 2 GiB
     static let blockSize = 65536                               // sparse commit granularity
 
@@ -1050,7 +1057,13 @@ final class NovaGPU {
                 withUnsafeTemporaryAllocation(of: Float.self, capacity: 12) { clipBuf in
                     clipBuf.initialize(repeating: 0)
                     let cPtr = clipBuf.baseAddress!
-                    let vectorCount = mode == 0 ? idxCount / 2 : idxCount
+                    // Per-frame budget: at most MAX_SCREEN_VECTORS
+                    // vectors are plotted (the VPU pool's rated
+                    // on-screen capacity); excess vectors in the
+                    // command are dropped, as a display list that
+                    // overruns its hardware budget would be.
+                    let vectorCount = min(mode == 0 ? idxCount / 2 : idxCount,
+                                          Self.maxScreenVectors)
                     for v in 0..<vectorCount {
                         let i0 = Int(ibWords[mode == 0 ? v * 2 : v])
                         let i1 = mode == 0 ? Int(ibWords[v * 2 + 1]) : i0

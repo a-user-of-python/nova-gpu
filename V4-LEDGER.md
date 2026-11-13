@@ -114,3 +114,12 @@ the judge).
 - App: Vectors tab (plot-unit wireframe cube + corner points,
   FPS readout); Live Scene now uses vertexLitProgramV4.
 - Status: pushed behind the attempt-2 fix run; awaiting both.
+
+## Spec update (Sean, 12:45 ET) — vector pool sizing
+- MAX_SCREEN_VECTORS = 65,536 -> VPU_COUNT = 131,072 (was the
+  4096 placeholder). Pool is virtual: a VPU is a stateless
+  48-byte work slot, demand-allocated per workload on the host
+  thread running it — no 131,072-object array, zero idle cost;
+  the plot path enforces the per-frame budget (excess vectors
+  dropped). HostTests assert the counts; bench gains a plot
+  saturation sweep (1k/8k/32k/65,536 vectors).

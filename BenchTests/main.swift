@@ -247,6 +247,59 @@ do {
               "vertex=\(ms(r.prof.vertexMs)) raster=\(ms(r.prof.rasterMs))")
     }
     NovaGPU.clusterCount = 48
+
+    // 6. Plot-unit saturation (v4): random line vectors at rising
+    //    counts up to the full MAX_SCREEN_VECTORS budget, showing
+    //    where the serial positioning + DDA pass saturates. The
+    //    vectors are short random segments in NDC [-0.9, 0.9]^2.
+    do {
+        let gpu = NovaGPU()
+        let fbW = 640, fbH = 480
+        let fb = try gpu.alloc(size: UInt64(fbW * fbH * 4))
+        gpu.framebuffer = fb; gpu.fbWidth = fbW; gpu.fbHeight = fbH
+        var flatB = ShaderBuilder()
+        flatB.ldattr(0, 1); flatB.out(0, 0); flatB.end()
+        gpu.fragmentProgram = flatB.build()
+        let maxV = NovaGPU.maxScreenVectors
+        let nv = maxV * 2
+        var rng: UInt64 = 0xABCDEF
+        func fr() -> Float {
+            rng = rng &* 6364136223846793005 &+ 1442695040888963407
+            return Float((rng >> 40) & 0xFFFFFF) / Float(0x1000000) * 1.8 - 0.9
+        }
+        let vbh = try gpu.alloc(size: UInt64(nv * 48))
+        var vbytes = [UInt8]()
+        vbytes.reserveCapacity(nv * 48)
+        for _ in 0..<nv {
+            var rec = [Float](repeating: 0, count: 12)
+            rec[0] = fr(); rec[1] = fr(); rec[2] = 0.5
+            for f in rec { withUnsafeBytes(of: f.bitPattern) { vbytes.append(contentsOf: $0) } }
+        }
+        gpu.vramWrite(at: vbh, bytes: vbytes)
+        let ibh = try gpu.alloc(size: UInt64(maxV * 2 * 4))
+        var ibytes = [UInt8]()
+        ibytes.reserveCapacity(maxV * 2 * 4)
+        for i in 0..<(maxV * 2) { withUnsafeBytes(of: UInt32(i)) { ibytes.append(contentsOf: $0) } }
+        gpu.vramWrite(at: ibh, bytes: ibytes)
+        gpu.vertexBuffer = vbh; gpu.indexBuffer = ibh
+        let ident: [Float] = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+        for r in 0..<4 { gpu.setUniform(index: r, (ident[r * 4], ident[r * 4 + 1], ident[r * 4 + 2], ident[r * 4 + 3])) }
+        gpu.setUniform(index: 10, (0.25, 1.0, 0.35, 1.0))
+        for count in [1024, 8192, 32768, 65536] {
+            var times: [Double] = []
+            var frags: UInt64 = 0
+            for rep in 0..<3 {
+                try gpu.clearFramebuffer(rgba: 0xFF0A0A12)
+                let fBefore = gpu.stats.fragmentsShaded
+                let t = try gpu.plotVectors(indexCount: count * 2, mode: 0)
+                times.append(t)
+                if rep == 2 { frags = gpu.stats.fragmentsShaded - fBefore }
+            }
+            let med = median(times)
+            bench("plot-lines vectors=\(count) ms=\(ms(med)) " +
+                  "us_per_vector=\(ms(med * 1000 / Double(count))) fragments=\(frags)")
+        }
+    }
 } catch {
     print("BENCH FAILED: \(error)")
     exit(1)

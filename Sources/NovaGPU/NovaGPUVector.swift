@@ -20,16 +20,19 @@
 // matrix math (ngp_mat4) the shader stage's VMAT4 executes — and
 // hands the positioned triangle onward. The GPU owns a pool of
 // VPU_COUNT units, sized at 2× the on-screen vector limit for
-// double-capacity headroom:
+// double-capacity headroom (Sean's numbers, 2026-11-13):
 //
-//     VPU_COUNT = 2 × MAX_SCREEN_VECTORS
+//     MAX_SCREEN_VECTORS = 65,536
+//     VPU_COUNT = 2 × MAX_SCREEN_VECTORS = 131,072
 //
-// MAX_SCREEN_VECTORS is a placeholder (4096) until Sean fixes the
-// on-screen vector number; both live in NovaGPUParameters so the
-// count changes in exactly one place. VPUs are stateless
-// datapaths in this model (like real fixed-function units): the
-// pool count is accounted in GPUStats.vpuCount and bounds the
-// plot unit's per-frame vector budget, not a software bottleneck.
+// Both live on NovaGPU (maxScreenVectors / vpuCount) so the
+// counts change in exactly one place. The pool is virtual: a VPU
+// is a stateless datapath (the 48-byte struct below — one
+// workload's registers), demand-allocated on the stack of the
+// host thread running the workload and scheduled onto the host's
+// real threads. There is no array of 131,072 VPU objects and no
+// idle cost; the rated capacity is the addressable limit, and it
+// bounds the plot unit's per-frame vector budget.
 
 /// The grab unit (v4): a vertex-fetch path specialised for pulling
 /// 3D vector attributes out of VRAM. Where the v3 vertex stage
