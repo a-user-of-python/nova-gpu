@@ -3,6 +3,7 @@
 #include "NovaGPUFast.h"
 
 #include <math.h>
+#include <stddef.h>
 
 #if defined(__aarch64__)
 #include <arm_neon.h>
@@ -232,6 +233,42 @@ void ngp_mat4_f32(float *d, const float *a, const float *u, int lanes) {
         }
     }
 #endif
+}
+
+// MARK: - Fragment writeback (v5)
+
+static uint8_t ngp_rgba_byte(float c) {
+    // Swift.max(c, 0) in Comparable form: (c < 0) ? 0 : c — NaN
+    // fails the comparison and propagates, as in Swift.
+    float t = c < 0.0f ? 0.0f : c;
+    // Swift.min(t, 1) in Comparable form: (1 < t) ? 1 : t.
+    t = 1.0f < t ? 1.0f : t;
+    float v = t * 255.0f;
+    // v is in [0, 255] here, or NaN, or -0.0 (-0.0 >= 0 holds).
+    // Swift's UInt8(v) truncates toward zero; a NaN has no Swift
+    // behaviour to match (it traps), so it writes 0.
+    if (!(v >= 0.0f)) return 0;
+    return (uint8_t)v;
+}
+
+int ngp_flush_writeback(const float *col, const int64_t *px, int count,
+                        uint8_t *const *table, int tableCount,
+                        uint64_t fb, int firstBlock, int32_t *skip) {
+    int skips = 0;
+    for (int i = 0; i < count; i++) {
+        uint64_t byteAddr = fb + (uint64_t)px[i] * 4;
+        int tableIdx = (int)(byteAddr >> 16) - firstBlock;
+        uint8_t *p = NULL;
+        if (tableIdx >= 0 && tableIdx < tableCount) p = table[tableIdx];
+        if (p == NULL) { skip[skips++] = (int32_t)i; continue; }
+        int o = (int)(byteAddr & 0xFFFF);
+        const float *c = col + i * 4;
+        p[o] = ngp_rgba_byte(c[0]);
+        p[o + 1] = ngp_rgba_byte(c[1]);
+        p[o + 2] = ngp_rgba_byte(c[2]);
+        p[o + 3] = ngp_rgba_byte(c[3]);
+    }
+    return skips;
 }
 
 // MARK: - Integer ops (UInt32 view of the register file)
