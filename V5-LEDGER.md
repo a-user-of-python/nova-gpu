@@ -72,7 +72,13 @@ in this ledger as a proposed trade and NOT shipped.
   before positioning, and every corner compares against it —
   the test is strictly stronger (and the honest design: a
   reference the gather cannot contaminate).
-- Status: fix pushed, awaiting CI.
+- CI run 43482787469 (fix): **SUCCESS, all jobs green.**
+  Section 11 passes in full — fault now detected at exactly
+  12 corners / max error 0.5, faulted frame differs, armed ==
+  unarmed frames on cube + sphere, lifetime accumulates.
+  Bench: pass 14.4M tri/s; armed frame 19.21 ms vs 19.56
+  unarmed same run (pass cost ≈2.1 ms/frame by its own
+  accounting, inside scene noise). Attempt 1 DONE.
 
 ## Attempt 1 plan (as written before implementation)
 - Device: draw() gains an optional VPU test pass after the vertex
@@ -93,7 +99,22 @@ in this ledger as a proposed trade and NOT shipped.
 - Expected: checksums unchanged (the pass is observational when
   the VPUs are correct — and they are the same ngp_mat4).
 
-## Attempt 2 — VPU / plot optimisation (planned)
+## Attempt 2 — VPU / plot optimisation
+- Implemented as planned below: VPU.positionWide (one ngp_mat4
+  over grouped grabbed records), GrabUnit.grabPosition for
+  endpoints; the test pass now grabs per range in 256-triangle
+  groups, issues wide, compares in-range (per-range counters,
+  serial reduce + serial gather); plot pass 1 batches endpoints
+  (NovaGPU.plotBatchSize = 128; lines fetch 2 records/vector —
+  the duplicate third vertex v4 computed is gone). Host tests:
+  section 12 (positionWide bit-identical to per-triangle VPU
+  for groups 1..250 tris) + 9f (plot frame invariant at batch
+  sizes 1 / 7 / 1024). Bench: vpu-micro-wide A/B.
+- Expected: section 9c/9d/9e pixel-exactness unchanged; test
+  pass tri/s up from 14.4M; plot pass-1 ms down at all scales.
+- Status: pushed, awaiting CI.
+
+## Attempt 2 plan (as written before implementation)
 - Wide calculator issue: grabbed triangle records are positioned
   in groups through one ngp_mat4 call (lanes independent, order
   per lane unchanged — bit-identical by the v4 argument, and
