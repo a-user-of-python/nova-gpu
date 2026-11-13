@@ -572,6 +572,51 @@ final class NovaGPU {
     /// profiling cost the bench pays deliberately; off in production).
     static var profileFlushTiming = false
 
+    // MARK: - v6 operating knobs (governor-controlled)
+
+    /// Operating knobs adjusted by the v6 governor chip (see
+    /// NovaGovernor.swift) — or set directly by a host that wants a
+    /// fixed operating point. EVERY knob changes only how work is
+    /// partitioned and scheduled, never the arithmetic: the work
+    /// list order, the per-pixel expressions and every accumulation
+    /// order are untouched, so the framebuffer is bit-identical at
+    /// any setting (host-test section 13 proves it). The defaults
+    /// are the v5 constants — an untouched device behaves as v5.
+    ///
+    /// Rows of framebuffer per raster chunk (draw + plot pass 2).
+    /// Finer grain = more, smaller chunks: shorter stage tail,
+    /// more per-chunk setup. Coarser = the reverse.
+    var rasterChunkRows = 4
+    /// Fan-out ranges for the clip + bin stages of draw().
+    var clipRangeCount = 32
+    /// Cap on how many iterations of a pipeline stage may run
+    /// concurrently (the governor's GPU power share: how much of
+    /// the host the GPU stages may occupy at once). 0 = uncapped —
+    /// DispatchQueue.concurrentPerform exactly as v5 ran it.
+    var stageWidth = 0
+
+    /// concurrentPerform with an optional width cap: iterations
+    /// run in consecutive groups of at most `width`, each group
+    /// fully concurrent, groups in order. Work items are the same
+    /// independent units either way (disjoint warps / ranges /
+    /// chunks whose results merge in index order), so capping
+    /// changes only scheduling, never results. width <= 0 or
+    /// >= iterations is exactly DispatchQueue.concurrentPerform.
+    static func parallelFor(_ iterations: Int, width: Int, _ body: (Int) -> Void) {
+        if iterations <= 0 { return }
+        if width <= 0 || width >= iterations {
+            DispatchQueue.concurrentPerform(iterations: iterations, execute: body)
+            return
+        }
+        var base = 0
+        while base < iterations {
+            let n = min(width, iterations - base)
+            let b0 = base
+            DispatchQueue.concurrentPerform(iterations: n) { i in body(b0 + i) }
+            base += n
+        }
+    }
+
     func setUniform(index: Int, _ v: (Float, Float, Float, Float)) {
         guard index >= 0 && index < 16 else { return }
         uniforms[index * 4 + 0] = v.0; uniforms[index * 4 + 1] = v.1
@@ -625,7 +670,7 @@ final class NovaGPU {
         defer { perWarpOps.deinitialize(count: max(warpCount, 1)); perWarpOps.deallocate() }
 
         func runWarps(_ body: @escaping (Int, Int) -> WarpContext) {
-            DispatchQueue.concurrentPerform(iterations: warpCount) { warp in
+            Self.parallelFor(warpCount, width: self.stageWidth) { warp in
                 let base = warp * ShaderExecutor.warpSize
                 let count = min(ShaderExecutor.warpSize, lanes - base)
                 if count <= 0 { return }
@@ -872,7 +917,7 @@ final class NovaGPU {
         prof.snapshotMs = Self.nowMs() - pT0
         let pV0 = Self.nowMs()
         let vbF = vbFloats
-        DispatchQueue.concurrentPerform(iterations: warpCount) { warp in
+        Self.parallelFor(warpCount, width: stageWidth) { warp in
             let base = warp * 32
             let count = min(32, vertexCount - base)
             // v4 grab unit: fetch this warp's attributes with wide
@@ -974,9 +1019,9 @@ final class NovaGPU {
         // behaviour, is unchanged.
         let pC0 = Self.nowMs()
         final class WorkBox { var tris: [WorkTri] = [] }
-        let rangeCount = min(32, max(triCount, 1))
+        let rangeCount = min(max(clipRangeCount, 1), max(triCount, 1))
         let boxes = (0..<rangeCount).map { _ in WorkBox() }
-        DispatchQueue.concurrentPerform(iterations: rangeCount) { range in
+        Self.parallelFor(rangeCount, width: stageWidth) { range in
             let lo = triCount * range / rangeCount
             let hi = triCount * (range + 1) / rangeCount
             var local: [WorkTri] = []
@@ -1035,14 +1080,14 @@ final class NovaGPU {
         let fbBlocks = blockPointers(addr: framebuffer, size: fbAllocSize)
         let fbFirstBlock = blockIndex(framebuffer)
         let fb = framebuffer
-        let chunkRows = 4
+        let chunkRows = max(rasterChunkRows, 1)
         let chunkCount = (height + chunkRows - 1) / chunkRows
         // Binning fans out over the same ranges (per-range bin
         // lists merged in range order keep every chunk's triangle
         // order identical to the serial build).
         final class BinBox { var bins: [[Int]] = [] }
         let binBoxes = (0..<rangeCount).map { _ in BinBox() }
-        DispatchQueue.concurrentPerform(iterations: rangeCount) { range in
+        Self.parallelFor(rangeCount, width: stageWidth) { range in
             var local: [[Int]] = [[Int]](repeating: [], count: chunkCount)
             for wi in workStarts[range]..<workStarts[range + 1] {
                 let wt = work[wi]
@@ -1075,7 +1120,7 @@ final class NovaGPU {
         }
 
         fbBlocks.withUnsafeBufferPointer { fbTable in
-            DispatchQueue.concurrentPerform(iterations: chunkCount) { chunk in
+            Self.parallelFor(chunkCount, width: stageWidth) { chunk in
                 let y0 = chunk * chunkRows
                 let y1 = min(height, y0 + chunkRows)
                 // Per-chunk warp scratch, allocated once (v1 allocated
@@ -1182,7 +1227,7 @@ final class NovaGPU {
         }
         unis.withUnsafeBufferPointer { ub in
             let mPtr = ub.baseAddress!
-            DispatchQueue.concurrentPerform(iterations: ranges.count) { r in
+            Self.parallelFor(ranges.count, width: stageWidth) { r in
                 let lo = ranges[r].0, hi = ranges[r].1
                 if lo >= hi { return }
                 var mism = 0
@@ -1314,7 +1359,7 @@ final class NovaGPU {
         let depthPtr = UnsafeMutablePointer<Float>.allocate(capacity: width * height)
         depthPtr.initialize(repeating: -1.0, count: width * height)
         defer { depthPtr.deinitialize(count: width * height); depthPtr.deallocate() }
-        let chunkRows = 4
+        let chunkRows = max(rasterChunkRows, 1)
         let chunkCount = (height + chunkRows - 1) / chunkRows
         var chunkPx: [[Int]] = [[Int]](repeating: [], count: chunkCount)
 
@@ -1479,7 +1524,7 @@ final class NovaGPU {
             let counts = UnsafeMutablePointer<UInt64>.allocate(capacity: ranges.count)
             counts.initialize(repeating: 0, count: ranges.count)
             defer { counts.deinitialize(count: ranges.count); counts.deallocate() }
-            DispatchQueue.concurrentPerform(iterations: ranges.count) { k in
+            Self.parallelFor(ranges.count, width: stageWidth) { k in
                 let box = boxes[k]
                 counts[k] = processRange(ranges[k].0, ranges[k].1) { di, z in
                     box.samples.append((di, z))
@@ -1512,7 +1557,7 @@ final class NovaGPU {
             }
         }
         fbBlocks.withUnsafeBufferPointer { fbTable in
-            DispatchQueue.concurrentPerform(iterations: chunkCount) { chunk in
+            Self.parallelFor(chunkCount, width: stageWidth) { chunk in
                 let list = chunkPx[chunk]
                 if list.isEmpty { return }
                 let warpPx = UnsafeMutablePointer<Int>.allocate(capacity: 32)
