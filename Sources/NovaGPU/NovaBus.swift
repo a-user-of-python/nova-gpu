@@ -94,6 +94,12 @@ enum GPUCommand: UInt64 {
     case vpuTest    = 20   // v5 in-scene VPU test: a0 != 0 arms the
                            // in-draw VPU test (and resets its result
                            // window); a0 == 0 disarms it
+    case governorCmd = 21  // v6: forwarded to the attached
+                           // NovaGovernorDevice — a0: 1 = enable,
+                           // 2 = disable, 3 = tick (a1 = frame-work
+                           // microseconds). The chip also ticks on
+                           // every PRESENT by itself; this is the
+                           // explicit channel.
 }
 
 enum GPUErrorCode: UInt64 {
@@ -142,6 +148,10 @@ final class NovaGPUDevice {
     /// Host display hook (like NovaMemory.consoleOutput): called when a
     /// PRESENT command completes, with the GPU and framebuffer handle.
     var onPresent: ((NovaGPU, UInt64) -> Void)?
+
+    /// v6: the attached supervisor chip, if any. Ring opcode 21
+    /// forwards to it, and it is ticked on every PRESENT.
+    var governor: NovaGovernorDevice?
 
     private var ringBase: UInt64 = 0
     private var ringSlots: UInt64 = 0
@@ -407,9 +417,20 @@ final class NovaGPUDevice {
                 try gpu.launchCompute(lanes: Int(desc.args[0]), buffer: desc.args[1])
             case .fenceCmd:
                 fenceValue = desc.args[0]
+            case .governorCmd:
+                if let gov = governor {
+                    switch desc.args[0] {
+                    case 1: gov.chip.setEnabled(true)
+                    case 2: gov.chip.setEnabled(false)
+                    case 3: gov.chip.tick(GovernorTelemetry(
+                                frameWorkMs: Double(desc.args[1]) / 1000))
+                    default: break
+                    }
+                }
             case .present:
                 presentReady = true
                 onPresent?(gpu, desc.args[0])
+                governor?.notePresent()
             }
         } catch let e as GPUError {
             switch e {
