@@ -146,6 +146,34 @@ in this ledger as a proposed trade and NOT shipped.
   convicted floor under every scene.
 - Expected: all framebuffer checksums byte-identical (host
   tests are the gate); fragExecCpu down on nofrag/flatfrag.
+- CI run 43485771309: **SUCCESS, all jobs** — every checksum
+  and frame comparison held, so the C writeback is byte-exact.
+  Measured (HOST): nofrag fragExecCpu 4.88 ms vs 5.18 in the
+  attempt-2 run; flatfrag 5.41 vs 5.45; plot pass 2 mixed
+  (65k: 245 vs 244 — flat; 32k: 83.8 vs 92.9; 1k: 2.56 vs
+  4.12). Honest verdict: **kept** (byte-exact, no regression
+  anywhere, small gains at some scales) but the flush floor is
+  mostly NOT the per-pixel conversion — it is the surrounding
+  Swift warp machinery (default-colour init, runWarp setup,
+  per-warp call overhead × ~9k warps). The writeback was the
+  convicted part; the conviction was only partly right.
+  Also this run: armed `app-scene-vputest` frame 15.22 ms ==
+  unarmed `app-scene-lit` 15.24 ms; test pass 37.6M tri/s.
+  Attempt 3 DONE (kept).
+
+## Attempt 4 — clip fast path without the array round-trip
+- Change: the clip ranges gathered `tri` as a [ShadedVertex]
+  array (3 × ~530-byte struct copies), clipTriangle returned
+  it, and the fan copied the vertices again into the WorkTri.
+  For a fully-inside triangle (the overwhelming majority) the
+  range now checks the six plane expressions on the gathered
+  vertices directly (new `fullyInside`, same expressions as
+  clipTriangle's dist) and appends the WorkTri in place — the
+  exact WorkTri the fan of the unclipped triangle produced.
+  Partially-outside triangles take the unchanged clipTriangle
+  path.
+- Expected: work list value-identical (host checksums are the
+  gate); clip stage ms down.
 - Status: pushed, awaiting CI.
 
 ## Attempt 2 plan (as written before implementation)
