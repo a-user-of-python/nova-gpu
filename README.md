@@ -61,6 +61,49 @@ later (the bus is the compatibility contract for that merge).
   (wireframe cube + corner points, plot unit only). Host tests
   prove plotted pixel sets against a Double-precision reference.
 
+## v5 — in-scene VPU test + optimisation
+
+- **Direct VPU test inside the Live Scene** (bus command 20):
+  toggle it and every scene triangle is positioned through the
+  real VPU path — grab unit → 3-axis calculator, scheduled over
+  the MGVPU clusters — bit-compared against the shader stage's
+  own clip positions (snapshotted pristine before the pass),
+  and the frame renders **from the VPU positions**, so a wrong
+  VPU visibly breaks the picture. The HUD shows the verdict
+  (BIT-EXACT, or MISMATCH stated plainly — never rounded into
+  a pass), triangles tested, mismatched corners, max position
+  error, triangles/sec and MGVPU clusters engaged, next to the
+  normal FPS readout. Host tests prove it both directions:
+  armed frames byte-identical to unarmed, and an injected +0.5
+  fault is caught at exactly 12 mismatched corners with the
+  faulted frame differing from the clean one.
+- **Wide VPU issue**: each triangle is still grabbed
+  individually (its own VPU workload), but the calculator now
+  issues in groups (`VPU.positionWide`, bit-identical per
+  lane). HOST micro, same-run A/B: 52.6M → 140.4M triangles/s
+  serial (2.67×) for identical grab + position work; the
+  in-scene test pass runs at 34–38M triangles/s (HOST), about
+  1 ms per frame at the app scene's 29,696 triangles. The
+  plot unit's positioning pass batches endpoints the same way
+  (output proven batch-size invariant at 1 / 7 / 1024); the
+  2,048-vector parallel threshold was re-swept and stays —
+  its 65,536-vector minimum sits exactly at 2048.
+- **C fragment writeback** (`ngp_flush_writeback`): colour
+  conversion + block-table stores in the C core with the
+  identical clamp/convert expressions; lanes on uncommitted
+  blocks replay through the original locked fallback. Gain
+  is small (the flush floor is mostly warp machinery, not
+  conversion) — recorded honestly in `BENCH-v5.md`.
+- **Clip fast path**: fully-inside triangles append their
+  work-triangle in place (same plane expressions, identical
+  work list), skipping the per-triangle array round-trip:
+  clip stage ≈2.5× faster on HOST (2.30 → 0.81 ms).
+- The bit-exact invariant holds throughout: every pre-v5
+  framebuffer checksum and frame comparison passes unchanged
+  in CI. All figures above are HOST (CI runner) numbers; the
+  device verdict is Sean's. Full record: `BENCH-v5.md`,
+  attempts in `V5-LEDGER.md`.
+
 ## Layout
 
 - `Sources/NovaGPU/` — the GPU core (shader ISA + executor, the GPU,
