@@ -88,6 +88,7 @@ func appScene(frames: Int, vProg: [UInt32], fProg: [UInt32]) throws
         sum.clipMs = pS.clipMs + pT.clipMs
         sum.binMs = pS.binMs + pT.binMs
         sum.rasterMs = pS.rasterMs + pT.rasterMs
+        sum.fragExecMs = pS.fragExecMs + pT.fragExecMs
         sum.totalMs = pS.totalMs + pT.totalMs
         profs.append(sum)
         fragCounts.append(Double(gpu.stats.fragmentsShaded - fragsBefore))
@@ -100,6 +101,7 @@ func appScene(frames: Int, vProg: [UInt32], fProg: [UInt32]) throws
     med.clipMs = median(p.map { $0.clipMs })
     med.binMs = median(p.map { $0.binMs })
     med.rasterMs = median(p.map { $0.rasterMs })
+    med.fragExecMs = median(p.map { $0.fragExecMs })
     med.totalMs = median(p.map { $0.totalMs })
     return (median(Array(frameMs.dropFirst())), med, median(Array(fragCounts.dropFirst())))
 }
@@ -108,6 +110,7 @@ func reportScene(_ name: String, _ r: (frame: Double, prof: DrawProfile, frags: 
     bench("\(name) frame_ms=\(ms(r.frame)) draws_ms=\(ms(r.prof.totalMs)) " +
           "snapshot=\(ms(r.prof.snapshotMs)) vertex=\(ms(r.prof.vertexMs)) " +
           "clip=\(ms(r.prof.clipMs)) bin=\(ms(r.prof.binMs)) raster=\(ms(r.prof.rasterMs)) " +
+          "fragExecCpu=\(ms(r.prof.fragExecMs)) " +
           "fragments=\(Int(r.frags)) host_fps=\(ms(1000 / max(r.frame, 0.001)))")
 }
 
@@ -115,9 +118,78 @@ let vsLit = NovaGPUStandard.vertexLitProgram()
 let fsLit = NovaGPUStandard.fragmentLitProgram()
 
 do {
+    NovaGPU.profileFlushTiming = true
     // 1. The app scene, as shipped.
     let app = try appScene(frames: 8, vProg: vsLit, fProg: fsLit)
     reportScene("app-scene-lit", app)
+
+    // 1b. Executor floor: fragment program is a bare END (default
+    //     colour out) — raster wall then holds coverage +
+    //     interpolation + executor fixed overhead only.
+    var eb = ShaderBuilder()
+    eb.end()
+    let nofrag = try appScene(frames: 8, vProg: vsLit, fProg: eb.build())
+    reportScene("app-scene-nofrag", nofrag)
+
+    // 1c. Pure executor micro-bench: 20,000 warps of the lit
+    //     fragment program against static varying/colour buffers.
+    do {
+        let decoded = DecodedShader(fsLit)
+        let varBuf = UnsafeMutablePointer<Float>.allocate(capacity: 32 * 32)
+        let colBuf = UnsafeMutablePointer<Float>.allocate(capacity: 32 * 4)
+        for i in 0..<(32 * 32) { varBuf[i] = Float(i % 17) * 0.05 }
+        defer { varBuf.deallocate(); colBuf.deallocate() }
+        var ctx = WarpContext.dummy()
+        ctx.uniforms = [Float](repeating: 0.5, count: 64)
+        ctx.attrPtr = UnsafePointer(varBuf)
+        ctx.outPtr = colBuf
+        let warps = 20000
+        let t0 = NovaGPU.nowMs()
+        var ops = 0
+        for _ in 0..<warps {
+            ops += ShaderExecutor.runWarp(decoded: decoded, lanes: 32, ctx: ctx)
+        }
+        let dt = NovaGPU.nowMs() - t0
+        bench("executor-fraglit warps=\(warps) ms=\(ms(dt)) " +
+              "us_per_warp=\(ms(dt * 1000 / Double(warps))) laneOps=\(ops)")
+    }
+    // 1d. Pure executor micro-bench: lit VERTEX program through the
+    //     closure attribute path (the path draw() uses today).
+    do {
+        let decoded = DecodedShader(vsLit)
+        let raw = UnsafeMutablePointer<Float>.allocate(capacity: 32 * 12)
+        for i in 0..<(32 * 12) { raw[i] = Float(i % 13) * 0.1 - 0.6 }
+        defer { raw.deallocate() }
+        var ctx = WarpContext.dummy()
+        ctx.uniforms = NovaGPUStandard.matIdentity()
+            + [Float](repeating: 0, count: 48)
+        // c0..c3 = identity rows; c4..c7 masks and c8/c9 set below.
+        for r in 0..<4 { for c in 0..<4 { ctx.uniforms[r * 4 + c] = r == c ? 1 : 0 } }
+        ctx.uniforms[16] = 1; ctx.uniforms[21] = 1; ctx.uniforms[26] = 1; ctx.uniforms[31] = 1
+        ctx.uniforms[32] = 0.577; ctx.uniforms[33] = 0.577; ctx.uniforms[34] = 0.577
+        ctx.uniforms[36] = 1; ctx.uniforms[37] = 1; ctx.uniforms[38] = 1; ctx.uniforms[39] = 1
+        ctx.attrProvider = { lane, slot in
+            let o = lane * 12
+            switch slot {
+            case 0: return (raw[o], raw[o + 1], raw[o + 2], 1)
+            case 1: return (raw[o + 3], raw[o + 4], raw[o + 5], 0)
+            case 2: return (raw[o + 6], raw[o + 7], 0, 0)
+            case 3: return (raw[o + 8], raw[o + 9], raw[o + 10], raw[o + 11])
+            default: return (0, 0, 0, 0)
+            }
+        }
+        var sink: Float = 0
+        ctx.outWriter = { _, _, x, _, _, _ in sink += x }
+        let warps = 20000
+        let t0 = NovaGPU.nowMs()
+        var ops = 0
+        for _ in 0..<warps {
+            ops += ShaderExecutor.runWarp(decoded: decoded, lanes: 32, ctx: ctx)
+        }
+        let dt = NovaGPU.nowMs() - t0
+        bench("executor-vertlit warps=\(warps) ms=\(ms(dt)) " +
+              "us_per_warp=\(ms(dt * 1000 / Double(warps))) laneOps=\(ops) sink=\(sink)")
+    }
 
     // 2. Fragment-cost isolation: identical geometry and coverage,
     //    fragment program reduced to pass-through colour.

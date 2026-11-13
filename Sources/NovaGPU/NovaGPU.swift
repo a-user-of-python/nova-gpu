@@ -79,6 +79,8 @@ struct DrawProfile {
     var clipMs: Double = 0       // clip + fan + screen transform (parallel ranges)
     var binMs: Double = 0        // triangle binning into row chunks
     var rasterMs: Double = 0     // rasterise + fragment shading + writeback
+    var fragExecMs: Double = 0   // of rasterMs: batcher flush (executor + writeback);
+                                 // only accumulated when NovaGPU.profileFlushTiming is set
     var totalMs: Double = 0
 }
 
@@ -122,6 +124,7 @@ private final class FragBatcher {
     var ops: UInt64 = 0
     var frags: UInt64 = 0
     var warps: UInt64 = 0
+    var execMs: Double = 0   // flush wall time (profileFlushTiming only)
 
     init(px: UnsafeMutablePointer<Int>, vars: UnsafeMutablePointer<Float>,
          col: UnsafeMutablePointer<Float>, decoded: DecodedShader, unis: [Float],
@@ -165,6 +168,8 @@ private final class FragBatcher {
     /// end of each chunk.
     func flush() {
         if count == 0 { return }
+        let fT0 = NovaGPU.profileFlushTiming ? NovaGPU.nowMs() : 0
+        defer { if NovaGPU.profileFlushTiming { execMs += NovaGPU.nowMs() - fT0 } }
         // v1 default lane colour: (0, 0, 0, 1) when the program
         // never writes OUT 0.
         for i in 0..<count {
@@ -433,6 +438,10 @@ final class NovaGPU {
     /// Stage timings of the most recent draw (v4 profiling).
     private(set) var lastDrawProfile = DrawProfile()
     static func nowMs() -> Double { ProcessInfo.processInfo.systemUptime * 1000 }
+    /// When true, FragBatcher.flush() accumulates its wall time into
+    /// DrawProfile.fragExecMs (two clock reads per warp flush — a
+    /// profiling cost the bench pays deliberately; off in production).
+    static var profileFlushTiming = false
 
     func setUniform(index: Int, _ v: (Float, Float, Float, Float)) {
         guard index >= 0 && index < 16 else { return }
@@ -845,11 +854,14 @@ final class NovaGPU {
         let chunkOps = UnsafeMutablePointer<UInt64>.allocate(capacity: chunkCount)
         let chunkFrags = UnsafeMutablePointer<UInt64>.allocate(capacity: chunkCount)
         let chunkWarps = UnsafeMutablePointer<UInt64>.allocate(capacity: chunkCount)
+        let chunkExec = UnsafeMutablePointer<Double>.allocate(capacity: chunkCount)
         for p in [chunkOps, chunkFrags, chunkWarps] { p.initialize(repeating: 0, count: chunkCount) }
+        chunkExec.initialize(repeating: 0, count: chunkCount)
         defer {
             for p in [chunkOps, chunkFrags, chunkWarps] {
                 p.deinitialize(count: chunkCount); p.deallocate()
             }
+            chunkExec.deinitialize(count: chunkCount); chunkExec.deallocate()
         }
 
         fbBlocks.withUnsafeBufferPointer { fbTable in
@@ -880,6 +892,7 @@ final class NovaGPU {
                 chunkOps[chunk] = batcher.ops
                 chunkFrags[chunk] = batcher.frags
                 chunkWarps[chunk] = batcher.warps
+                chunkExec[chunk] = batcher.execMs
             }
         }
 
@@ -889,6 +902,7 @@ final class NovaGPU {
             stats.laneOps += chunkOps[c]
             stats.fragmentsShaded += chunkFrags[c]
             fragWarps += chunkWarps[c]
+            prof.fragExecMs += chunkExec[c]
         }
         prof.rasterMs = Self.nowMs() - pR0
         stats.warpsIssued += UInt64(warpCount) + fragWarps
