@@ -769,5 +769,160 @@ do {
     check(wideOK, "VPU.positionWide is bit-identical to per-triangle VPU.position (groups 1..250 triangles)")
 }
 
+// MARK: 13. v6 governor chip: registers, ring, policy, pixel invariance
+do {
+    let govBase = NovaMemory.govBaseAddr
+    check(NovaGovernor.chipName == "NovaGovernor", "governor chip name lives in one place")
+
+    // MMIO register block on the shared memory (no GPU supervised).
+    let govA = NovaGovernorDevice()
+    govA.attach(to: mem)
+    check(mem.govDevice === govA, "governor device attaches to NovaMemory")
+    let gid = mem.mmioRead(govBase + GovRegister.id.rawValue)
+    check(gid == NovaGovernorDevice.deviceID, "governor device ID register",
+          String(format: "0x%016X", gid))
+    mem.mmioWrite(govBase + GovRegister.enable.rawValue, 1)
+    check(govA.chip.enabled, "governor enables via MMIO")
+    check(mem.mmioRead(govBase + GovRegister.status.rawValue) & 1 == 1,
+          "governor status register reports enabled")
+    for _ in 0..<40 { mem.mmioWrite(govBase + GovRegister.tick.rawValue, 30000) }
+    check(govA.chip.lastFrameMs == 30, "governor MMIO tick carries frame microseconds")
+    check(mem.mmioRead(govBase + GovRegister.medianUs.rawValue) == 30000,
+          "governor median register reads back the scripted window")
+    check(govA.chip.paceTierIndex >= 1 && govA.chip.actionsIssued >= 2,
+          "governor stepped the pace tier on scripted 30 ms frames",
+          "tier \(govA.chip.paceTierIndex), \(govA.chip.actionsIssued) actions")
+    mem.mmioWrite(govBase + GovRegister.enable.rawValue, 0)
+    check(!govA.chip.enabled && govA.chip.paceTierIndex == 0,
+          "governor disable via MMIO restores the v5 operating point")
+
+    // Ring opcode 21 on the shared device.
+    let govRing = NovaGovernorDevice()
+    govRing.supervise(device)
+    device.governor = govRing
+    try client.governorControl(1)
+    check(govRing.chip.enabled, "governor enables via ring opcode 21")
+    try client.governorControl(2)
+    check(!govRing.chip.enabled, "governor disables via ring opcode 21")
+    device.governor = nil
+
+    // Policy: pace tiers walk down under sustained overrun and
+    // back up under sustained headroom (deterministic script).
+    let pace = NovaGovernor()
+    pace.setEnabled(true)
+    for _ in 0..<120 { pace.tick(GovernorTelemetry(frameWorkMs: 30)) }
+    check(pace.paceTierIndex == 3, "pace tier steps 16.7 -> 33.3 under 30 ms frames",
+          "tier \(pace.paceTierIndex) (\(pace.paceTargetMs) ms)")
+    check(pace.actionLog.filter { $0.command == .setPaceTier }.count >= 3,
+          "pace steps are logged with reasons")
+    for _ in 0..<260 { pace.tick(GovernorTelemetry(frameWorkMs: 8)) }
+    check(pace.paceTierIndex == 0, "pace tier climbs back to 16.7 under 8 ms frames",
+          "tier \(pace.paceTierIndex)")
+
+    // Policy: jitter refines the grain, then caps the width;
+    // stability restores both.
+    let jit = NovaGovernor()
+    jit.setEnabled(true)
+    for i in 0..<120 { jit.tick(GovernorTelemetry(frameWorkMs: i % 6 == 5 ? 40 : 14)) }
+    check(jit.rasterChunkRows == 2 && jit.gpuStageWidth == 6,
+          "jitter refines grain to 2 then caps GPU width at 6",
+          "grain \(jit.rasterChunkRows), width \(jit.gpuStageWidth)")
+    for _ in 0..<200 { jit.tick(GovernorTelemetry(frameWorkMs: 14)) }
+    check(jit.gpuStageWidth == 0 && jit.rasterChunkRows == 4,
+          "stability restores width and grain",
+          "grain \(jit.rasterChunkRows), width \(jit.gpuStageWidth)")
+
+    // Policy: disabling mid-adaptation restores everything.
+    let dis = NovaGovernor()
+    dis.setEnabled(true)
+    for i in 0..<40 { dis.tick(GovernorTelemetry(frameWorkMs: i % 6 == 5 ? 40 : 14)) }
+    dis.setEnabled(false)
+    check(dis.rasterChunkRows == 4 && dis.gpuStageWidth == 0 && !dis.enabled,
+          "disable restores grain and width")
+    check(dis.actionLog.last?.command == .disable, "disable is the last logged action")
+
+    // Policy: CPU slice steering (halve over target, double far
+    // under, deadband between).
+    let cpu = NovaGovernor()
+    cpu.setEnabled(true)
+    cpu.tickCPU(sliceMs: 9.0, steps: cpu.cpuSliceSteps)
+    cpu.tickCPU(sliceMs: 9.0, steps: cpu.cpuSliceSteps)
+    cpu.tickCPU(sliceMs: 9.0, steps: cpu.cpuSliceSteps)
+    check(cpu.cpuSliceSteps == 12_500, "CPU slice halves toward the 2 ms target",
+          "\(cpu.cpuSliceSteps) steps")
+    cpu.tickCPU(sliceMs: 0.4, steps: cpu.cpuSliceSteps)
+    check(cpu.cpuSliceSteps == 25_000, "CPU slice doubles when far under target")
+    cpu.tickCPU(sliceMs: 2.0, steps: cpu.cpuSliceSteps)
+    check(cpu.cpuSliceSteps == 25_000, "CPU slice holds inside the deadband")
+
+    // Policy: VRAM pressure sheds scratch retention; relief
+    // restores it.
+    let memChip = NovaGovernor()
+    memChip.setEnabled(true)
+    for _ in 0..<40 {
+        memChip.tick(GovernorTelemetry(frameWorkMs: 16,
+                                       vramCommitted: 300 * 1024 * 1024))
+    }
+    check(!memChip.scratchRetention, "scratch shed under VRAM commit pressure")
+    for _ in 0..<40 {
+        memChip.tick(GovernorTelemetry(frameWorkMs: 16,
+                                       vramCommitted: 10 * 1024 * 1024))
+    }
+    check(memChip.scratchRetention, "scratch restored when VRAM pressure clears")
+
+    // Pixel invariance: the same scene renders byte-identically
+    // with raw knobs twisted and with the chip attached + live.
+    func renderGoverned(_ configure: (NovaMemory, NovaGPUDevice) -> Void) throws -> [UInt8] {
+        let m = NovaMemory(totalSize: 64 * 1024 * 1024)
+        let d = NovaGPUDevice()
+        let c = NovaBusClient(memory: m, device: d)
+        configure(m, d)
+        let cube = NovaGPUStandard.proofCube()
+        let fbW = 256, fbH = 192
+        let fb = try c.alloc(UInt64(fbW * fbH * 4))
+        let vb = try c.alloc(UInt64(cube.vertices.count * 4))
+        let ib = try c.alloc(UInt64(cube.indices.count * 4))
+        try c.uploadData(vb, data: NovaGPUStandard.vertexBytes(cube), guestStaging: STAGE)
+        try c.uploadData(ib, data: NovaGPUStandard.indexBytes(cube), guestStaging: STAGE)
+        let vs = NovaGPUStandard.vertexLitProgram()
+        let fs = NovaGPUStandard.fragmentLitProgram()
+        let sh = try c.alloc(8192)
+        try c.uploadData(sh, data: NovaGPUStandard.programBytes(vs), guestStaging: STAGE)
+        try c.uploadData(sh, off: 4096, data: NovaGPUStandard.programBytes(fs), guestStaging: STAGE)
+        try c.setShader(.setVShader, programHandle: sh, off: 0, len: vs.count * 4)
+        try c.setShader(.setFShader, programHandle: sh, off: 4096, len: fs.count * 4)
+        try c.setFBuf(fb, fbW, fbH)
+        try c.setVBuf(vb)
+        try c.setIBuf(ib)
+        let mvp: [Float] = [0.8, 0, 0, 0, 0, 0.8, 0, 0, 0, 0, 0.5, 0.5, 0, 0, 0, 1]
+        try NovaGPUStandard.setLitUniforms(c, mvp: mvp, light: (0.5, 1.0, 0.25))
+        try c.clear(0xFF200810)
+        try c.draw(indexCount: cube.indices.count)
+        try c.present(fb)
+        return try c.downloadData(fb, len: fbW * fbH * 4, guestStaging: DSTAGE)
+    }
+    let plain = try renderGoverned { _, _ in }
+    let twisted = try renderGoverned { _, d in
+        d.gpu.rasterChunkRows = 1
+        d.gpu.stageWidth = 1
+        d.gpu.clipRangeCount = 4
+    }
+    check(plain == twisted, "governor knobs (grain 1, width 1, clip 4) are pixel-invariant")
+    var govTicks: UInt64 = 0
+    let governed = try renderGoverned { m, d in
+        let g = NovaGovernorDevice()
+        g.attach(to: m)
+        g.supervise(d)
+        d.governor = g
+        g.chip.setEnabled(true)
+        for _ in 0..<40 { g.chip.tick(GovernorTelemetry(frameWorkMs: 30)) }
+        govTicks = g.chip.tickCount
+    }
+    check(plain == governed, "frame renders byte-identically with the governor attached and enabled")
+    note("governor ticks during governed render: \(govTicks)")
+} catch {
+    check(false, "governor suite", "\(error)")
+}
+
 print(failures == 0 ? "\nALL HOST TESTS PASSED" : "\n\(failures) HOST TEST(S) FAILED")
 exit(failures == 0 ? 0 : 1)
