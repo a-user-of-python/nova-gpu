@@ -919,7 +919,8 @@ final class NovaGPU {
         // unarmed frames byte-identical). Its wall time lands in
         // neither stage timer; it is reported in vpuTest.passMs.
         if vpuTestEnabled {
-            runVPUTestPass(triCount: triCount, snapshot: vbF, indices: ibWords,
+            runVPUTestPass(triCount: triCount, vertexCount: vertexCount,
+                           snapshot: vbF, indices: ibWords,
                            uniforms: unis, shaded: shadedPtr)
         }
 
@@ -1090,19 +1091,30 @@ final class NovaGPU {
     /// consumed) over the triangle's 9 axis values, and the
     /// resulting clip position of each corner is bit-compared
     /// against the clip the shader stage produced for the same
-    /// vertex (the independently computed reference). Workloads
-    /// are split into contiguous sub-ranges over the MGVPU
-    /// clusters and run concurrently. After the compare, each
-    /// shaded vertex's clip is OVERWRITTEN with the VPU's clip
-    /// (the gather), so the frame that renders is positioned by
-    /// the VPUs. Results accumulate into `vpuTest` (window) and
-    /// `vpuTestLifetime`.
-    private func runVPUTestPass(triCount: Int,
+    /// vertex (the independently computed reference — snapshotted
+    /// before the pass, so the gather below can never contaminate
+    /// a later comparison: every corner is checked against the
+    /// pristine shader value). Workloads are split into
+    /// contiguous sub-ranges over the MGVPU clusters and run
+    /// concurrently. After the compare, each shaded vertex's clip
+    /// is OVERWRITTEN with the VPU's clip (the gather), so the
+    /// frame that renders is positioned by the VPUs. Results
+    /// accumulate into `vpuTest` (window) and `vpuTestLifetime`.
+    private func runVPUTestPass(triCount: Int, vertexCount: Int,
                                 snapshot vbF: UnsafePointer<Float>,
                                 indices ibWords: UnsafePointer<UInt32>,
                                 uniforms unis: [Float],
                                 shaded shadedPtr: UnsafeMutablePointer<ShadedVertex>) {
         let t0 = Self.nowMs()
+        // Pristine reference: the shader stage's clip positions,
+        // copied before any gather write can touch them.
+        let refClip = UnsafeMutablePointer<Float>.allocate(capacity: max(vertexCount, 1) * 4)
+        defer { refClip.deallocate() }
+        for v in 0..<vertexCount {
+            let c = shadedPtr[v].clip
+            refClip[v * 4] = c.0; refClip[v * 4 + 1] = c.1
+            refClip[v * 4 + 2] = c.2; refClip[v * 4 + 3] = c.3
+        }
         let out = UnsafeMutablePointer<Float>.allocate(capacity: triCount * 12)
         defer { out.deallocate() }
         let ranges = MGVPU.subRanges(count: triCount)
@@ -1130,8 +1142,9 @@ final class NovaGPU {
             }
         }
         // Compare + gather (serial, in triangle order): the
-        // reference is the shader stage's clip for the corner's
-        // vertex; the gather writes the VPU clip over it.
+        // reference is the pristine snapshot of the shader stage's
+        // clip for the corner's vertex; the gather writes the VPU
+        // clip over the shaded vertex.
         let fault = Self.vpuTestFault
         var mismatches = 0
         var maxErr: Float = 0
@@ -1143,13 +1156,14 @@ final class NovaGPU {
                 var g0 = out[o]
                 let g1 = out[o + 1], g2 = out[o + 2], g3 = out[o + 3]
                 if fault != 0 && c == 0 { g0 += fault }   // host-test fault hook
-                let ref = shadedPtr[vi].clip
-                if g0.bitPattern != ref.0.bitPattern || g1.bitPattern != ref.1.bitPattern
-                    || g2.bitPattern != ref.2.bitPattern || g3.bitPattern != ref.3.bitPattern {
+                let r0 = refClip[vi * 4], r1 = refClip[vi * 4 + 1]
+                let r2 = refClip[vi * 4 + 2], r3 = refClip[vi * 4 + 3]
+                if g0.bitPattern != r0.bitPattern || g1.bitPattern != r1.bitPattern
+                    || g2.bitPattern != r2.bitPattern || g3.bitPattern != r3.bitPattern {
                     mismatches += 1
                 }
-                let d0 = abs(g0 - ref.0), d1 = abs(g1 - ref.1)
-                let d2 = abs(g2 - ref.2), d3 = abs(g3 - ref.3)
+                let d0 = abs(g0 - r0), d1 = abs(g1 - r1)
+                let d2 = abs(g2 - r2), d3 = abs(g3 - r3)
                 if d0.isFinite && d0 > maxErr { maxErr = d0 }
                 if d1.isFinite && d1 > maxErr { maxErr = d1 }
                 if d2.isFinite && d2 > maxErr { maxErr = d2 }
