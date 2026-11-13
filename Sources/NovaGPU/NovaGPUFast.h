@@ -68,6 +68,25 @@ void ngp_vnorm_f32(float *d, const float *a, int lanes);
 // component j = dot4(ra, row j) in DOT4 accumulation order.
 void ngp_mat4_f32(float *d, const float *a, const float *u, int lanes);
 
+// Fragment writeback (v5): converts `count` lane colours
+// (col[i*4 + c], FP32) to RGBA8888 and writes them into the
+// framebuffer at pixel indices px[i], through a block table:
+// table[t] is the host pointer for 64 KiB block (firstBlock + t),
+// or NULL for an uncommitted block. Pixels whose byte address
+// (fb + px*4) falls outside the table or on a NULL block are NOT
+// written; their lane indices are appended to skip[] (capacity:
+// count) and the skip count is returned, so the caller replays
+// exactly those through the locked fallback. Conversion matches
+// the Swift expression UInt8(min(max(c, 0), 1) * 255) per channel
+// with Swift's Comparable min/max forms (NaN propagates through
+// the clamps); a NaN channel reaches the cast as NaN — Swift's
+// UInt8(NaN) traps, so no defined Swift output exists there and
+// C writes 0 for that channel (the only divergence, and only
+// where the Swift code crashed).
+int ngp_flush_writeback(const float *col, const int64_t *px, int count,
+                        uint8_t *const *table, int tableCount,
+                        uint64_t fb, int firstBlock, int32_t *skip);
+
 // Integer ops over the register file's UInt32 view. F2I matches the
 // v1 expression UInt32(bitPattern: Int32(v.isFinite ? v : 0)) for
 // in-range values; shifts mask counts to 31, ISHR is arithmetic.
