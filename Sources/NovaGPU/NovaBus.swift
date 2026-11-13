@@ -91,6 +91,9 @@ enum GPUCommand: UInt64 {
     case plotVectors = 19  // v4 plot unit: a0=index count, a1=mode
                            // (0 = lines from index pairs, 1 = points);
                            // transform = uniforms c0..c3, colour = c10
+    case vpuTest    = 20   // v5 in-scene VPU test: a0 != 0 arms the
+                           // in-draw VPU test (and resets its result
+                           // window); a0 == 0 disarms it
 }
 
 enum GPUErrorCode: UInt64 {
@@ -398,6 +401,8 @@ final class NovaGPUDevice {
                 _ = try gpu.draw(indexCount: Int(desc.args[0]))
             case .plotVectors:
                 _ = try gpu.plotVectors(indexCount: Int(desc.args[0]), mode: Int(desc.args[1]))
+            case .vpuTest:
+                gpu.armVPUTest(desc.args[0] != 0)
             case .launch:
                 try gpu.launchCompute(lanes: Int(desc.args[0]), buffer: desc.args[1])
             case .fenceCmd:
