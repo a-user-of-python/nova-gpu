@@ -15,6 +15,25 @@ final class GPUEngine: ObservableObject {
     @Published var distinctColours: Int = 0
     @Published var triangles: Int = 0
     @Published var statusLine: String = "setting up…"
+    // v5 VPU test HUD state (written from the frame loop below).
+    @Published var vpuTestOn = false
+    @Published var vpuTriangles = 0
+    @Published var vpuMismatches = 0
+    @Published var vpuMaxErr: Double = 0
+    @Published var vpuTriPerSec: Double = 0
+    @Published var vpuClusters = 0
+    @Published var vpuPassMs: Double = 0
+    private var vpuWanted = false   // queue-confined: the toggle's wish
+    private var vpuArmed = false    // queue-confined: device state as last sent
+
+    /// The VPU test toggle: the frame loop arms the test at the top
+    /// of every frame batch while this is on (arming also resets
+    /// the device's per-frame result window) and disarms it once
+    /// when it goes off.
+    func setVPUTest(_ on: Bool) {
+        DispatchQueue.main.async { self.vpuTestOn = on }
+        queue.async { self.vpuWanted = on }
+    }
 
     private let fbW = 640, fbH = 480
     private let mem = NovaMemory(totalSize: 128 * 1024 * 1024)
@@ -111,6 +130,17 @@ final class GPUEngine: ObservableObject {
             // status poll) for each of its ~15 frame commands, on
             // top of the six per-object uniform resends now avoided.
             var batch: [(opcode: GPUCommand, fence: UInt64, args: [UInt64])] = []
+            // v5 VPU test: arm at the top of the batch while the
+            // toggle is on (each arm resets the result window, so
+            // the HUD numbers below cover exactly this frame's two
+            // draws); disarm once when the toggle goes off.
+            if vpuWanted {
+                batch.append((opcode: .vpuTest, fence: 0, args: [1, 0, 0, 0, 0]))
+                vpuArmed = true
+            } else if vpuArmed {
+                batch.append((opcode: .vpuTest, fence: 0, args: [0, 0, 0, 0, 0]))
+                vpuArmed = false
+            }
             batch.append((opcode: .clear, fence: 0, args: [UInt64(0xFF200810), 0, 0, 0, 0]))
             appendMVP(&batch, mvpSphere)
             batch.append((opcode: .setVBuf, fence: 0, args: [sphereV, 0, 0, 0, 0]))
@@ -147,12 +177,22 @@ final class GPUEngine: ObservableObject {
             lastTick = now
             let ms = now.timeIntervalSince(t0) * 1000
             let stats = device.gpu.stats
+            let vt = device.gpu.vpuTest
+            let vtArmed = vpuArmed
             DispatchQueue.main.async {
                 self.frame = img
                 self.frameMs = ms
                 if dt > 0 { self.fps = self.fps * 0.8 + (1 / dt) * 0.2 }
                 self.cusActive = stats.activeComputeUnits
                 self.vramUsedKiB = Int(self.device.gpu.vramReserved / 1024)
+                if vtArmed {
+                    self.vpuTriangles = vt.trianglesTested
+                    self.vpuMismatches = vt.mismatches
+                    self.vpuMaxErr = Double(vt.maxAbsError)
+                    self.vpuTriPerSec = vt.trianglesPerSecond
+                    self.vpuClusters = vt.clustersEngaged
+                    self.vpuPassMs = vt.passMs
+                }
             }
         } catch {
             DispatchQueue.main.async { self.statusLine = "frame failed: \(error)" }
@@ -216,6 +256,10 @@ struct LiveSceneView: View {
                 Rectangle().fill(Color.black).aspectRatio(4 / 3, contentMode: .fit)
                     .overlay(Text("warming up…").foregroundColor(.white))
             }
+            Toggle("VPU test — position + render via the VPUs", isOn: Binding(
+                get: { engine.vpuTestOn },
+                set: { engine.setVPUTest($0) }))
+                .font(.system(.body, design: .monospaced))
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 4) {
                 GridRow { Text("Compute units active"); Text("\(engine.cusActive) / \(NovaGPU.computeUnits)").bold() }
                 GridRow { Text("Triangles per frame"); Text("\(engine.triangles)").bold() }
@@ -223,6 +267,19 @@ struct LiveSceneView: View {
                 GridRow { Text("FPS"); Text(String(format: "%.1f", engine.fps)).bold() }
                 GridRow { Text("VRAM reserved"); Text("\(engine.vramUsedKiB) KiB").bold() }
                 GridRow { Text("Distinct colours"); Text("\(engine.distinctColours)").bold() }
+                if engine.vpuTestOn {
+                    GridRow {
+                        Text("VPU verdict")
+                        Text(engine.vpuMismatches == 0 ? "BIT-EXACT" : "MISMATCH")
+                            .bold().foregroundColor(engine.vpuMismatches == 0 ? .green : .red)
+                    }
+                    GridRow { Text("VPU triangles tested"); Text("\(engine.vpuTriangles)").bold() }
+                    GridRow { Text("VPU mismatched corners"); Text("\(engine.vpuMismatches)").bold() }
+                    GridRow { Text("VPU max position error"); Text(String(format: "%.3g", engine.vpuMaxErr)).bold() }
+                    GridRow { Text("VPU throughput"); Text("\(Int(engine.vpuTriPerSec)) tri/s").bold() }
+                    GridRow { Text("MGVPU clusters engaged"); Text("\(engine.vpuClusters) / \(NovaGPU.mgvpuCount)").bold() }
+                    GridRow { Text("VPU pass time"); Text(String(format: "%.2f ms", engine.vpuPassMs)).bold() }
+                }
             }.font(.system(.body, design: .monospaced))
             Text(engine.statusLine).font(.footnote).foregroundColor(.secondary)
             Spacer()
