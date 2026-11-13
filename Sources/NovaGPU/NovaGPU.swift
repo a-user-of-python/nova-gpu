@@ -983,10 +983,21 @@ final class NovaGPU {
             local.reserveCapacity(max(hi - lo, 0))
             for k in lo..<hi {
                 let t = k * 3
-                let tri = [shadedPtr[Int(ibWords[t])],
-                           shadedPtr[Int(ibWords[t + 1])],
-                           shadedPtr[Int(ibWords[t + 2])]]
-                let clipped = Self.clipTriangle(tri, usedSlots: usedSlots)
+                let v0 = shadedPtr[Int(ibWords[t])]
+                let v1 = shadedPtr[Int(ibWords[t + 1])]
+                let v2 = shadedPtr[Int(ibWords[t + 2])]
+                // v5 fast path: a triangle inside all six planes
+                // (the overwhelming majority) appends its WorkTri
+                // directly — clipTriangle would return it unchanged
+                // and the fan would build exactly this WorkTri, so
+                // the work list is value-identical; only the
+                // intermediate array copies are skipped.
+                if Self.fullyInside(v0) && Self.fullyInside(v1) && Self.fullyInside(v2) {
+                    local.append(WorkTri(v0: v0, v1: v1, v2: v2,
+                                         s0: screenOf(v0), s1: screenOf(v1), s2: screenOf(v2)))
+                    continue
+                }
+                let clipped = Self.clipTriangle([v0, v1, v2], usedSlots: usedSlots)
                 if clipped.count < 3 { continue }
                 for fan in 1..<(clipped.count - 1) {
                     let a = clipped[0], b = clipped[fan], c = clipped[fan + 1]
@@ -1545,6 +1556,15 @@ final class NovaGPU {
                                       pass2Ms: Self.nowMs() - pP1,
                                       totalMs: ms)
         return ms
+    }
+
+    /// True when every clip-plane distance of v is >= 0 — the same
+    /// six expressions clipTriangle's dist() evaluates.
+    private static func fullyInside(_ v: ShadedVertex) -> Bool {
+        let c = v.clip
+        return c.3 + c.0 >= 0 && c.3 - c.0 >= 0
+            && c.3 + c.1 >= 0 && c.3 - c.1 >= 0
+            && c.2 >= 0 && c.3 - c.2 >= 0
     }
 
     // Sutherland–Hodgman clipping against the 6 clip planes, in clip
