@@ -164,18 +164,23 @@ struct ShaderBuilder {
 struct WarpContext {
     /// 16 uniform vec4s, flattened [idx*4 + comp].
     var uniforms: [Float]
-    /// Fragment-stage fast path (speed round 3): when set, LDATTR
-    /// reads varyings straight from this buffer — layout [lane][32]
-    /// floats, slot s component c at lane*32 + s*4 + c, slots 0..7 —
-    /// instead of calling attrProvider per lane. Bit-identical: the
-    /// buffer is exactly what the fragment attrProvider closure read.
+    /// Stage fast path (speed round 3, generalized in v4): when set,
+    /// LDATTR reads straight from this buffer instead of calling
+    /// attrProvider per lane — layout [lane][attrStride] floats,
+    /// slot s component c at lane*attrStride + s*4 + c. Fragment:
+    /// attrStride 32 (varyings, slots 0..7). Vertex (v4 grab unit):
+    /// attrStride 16 (attributes, slots 0..3). Bit-identical either
+    /// way: the buffer holds exactly what attrProvider returned.
     var attrPtr: UnsafePointer<Float>? = nil
-    /// Fragment-stage fast path: when set, OUT 0 writes the lane
-    /// colour straight to this buffer — layout [lane][4] floats —
-    /// instead of calling outWriter per lane. Other OUT slots are
-    /// ignored, exactly as the fragment outWriter closure ignored
-    /// them.
+    var attrStride: Int = 32
+    /// Stage fast path: when set, OUT writes straight to this buffer
+    /// instead of calling outWriter per lane. Fragment layout
+    /// [lane][4]: only slot 0 is recorded, exactly as the fragment
+    /// outWriter closure recorded it. Vertex (v4): outFull = true
+    /// switches to layout [lane][32] and records every slot 0..7,
+    /// exactly as the vertex outWriter closure recorded them.
     var outPtr: UnsafeMutablePointer<Float>? = nil
+    var outFull: Bool = false
     /// (lane, slot) -> vec4. Vertex: attributes. Fragment: varyings.
     /// Compute: slot 0 = (gid, 0, 0, 0).
     var attrProvider: (Int, Int) -> (Float, Float, Float, Float)
@@ -266,45 +271,45 @@ private func ngp_rcp_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Fl
 @_silgen_name("ngp_mov_f32")
 private func ngp_mov_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ n: Int32)
 @_silgen_name("ngp_min_f32")
-private func ngp_min_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ n: Int32)
+func ngp_min_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ n: Int32)
 @_silgen_name("ngp_max_f32")
-private func ngp_max_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ n: Int32)
+func ngp_max_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ n: Int32)
 @_silgen_name("ngp_sqrt_f32")
-private func ngp_sqrt_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ n: Int32)
+func ngp_sqrt_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ n: Int32)
 @_silgen_name("ngp_rsq_f32")
-private func ngp_rsq_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ n: Int32)
+func ngp_rsq_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ n: Int32)
 @_silgen_name("ngp_cmplt_f32")
-private func ngp_cmplt_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ n: Int32)
+func ngp_cmplt_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ n: Int32)
 @_silgen_name("ngp_sel_f32")
-private func ngp_sel_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ n: Int32)
+func ngp_sel_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ n: Int32)
 @_silgen_name("ngp_dot3_f32")
-private func ngp_dot3_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ lanes: Int32)
+func ngp_dot3_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ lanes: Int32)
 @_silgen_name("ngp_dot4_f32")
-private func ngp_dot4_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ lanes: Int32)
+func ngp_dot4_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ lanes: Int32)
 @_silgen_name("ngp_cross_f32")
-private func ngp_cross_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ lanes: Int32)
+func ngp_cross_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ lanes: Int32)
 @_silgen_name("ngp_vnorm_f32")
-private func ngp_vnorm_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ lanes: Int32)
+func ngp_vnorm_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ lanes: Int32)
 @_silgen_name("ngp_mat4_f32")
-private func ngp_mat4_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ u: UnsafePointer<Float>, _ lanes: Int32)
+func ngp_mat4_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ u: UnsafePointer<Float>, _ lanes: Int32)
 @_silgen_name("ngp_f2i_u32")
-private func ngp_f2i_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<Float>, _ n: Int32)
+func ngp_f2i_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<Float>, _ n: Int32)
 @_silgen_name("ngp_i2f_f32")
-private func ngp_i2f_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<UInt32>, _ n: Int32)
+func ngp_i2f_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<UInt32>, _ n: Int32)
 @_silgen_name("ngp_iadd_u32")
-private func ngp_iadd_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<UInt32>, _ b: UnsafePointer<UInt32>, _ n: Int32)
+func ngp_iadd_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<UInt32>, _ b: UnsafePointer<UInt32>, _ n: Int32)
 @_silgen_name("ngp_isub_u32")
-private func ngp_isub_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<UInt32>, _ b: UnsafePointer<UInt32>, _ n: Int32)
+func ngp_isub_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<UInt32>, _ b: UnsafePointer<UInt32>, _ n: Int32)
 @_silgen_name("ngp_imul_u32")
-private func ngp_imul_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<UInt32>, _ b: UnsafePointer<UInt32>, _ n: Int32)
+func ngp_imul_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<UInt32>, _ b: UnsafePointer<UInt32>, _ n: Int32)
 @_silgen_name("ngp_iand_u32")
-private func ngp_iand_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<UInt32>, _ b: UnsafePointer<UInt32>, _ n: Int32)
+func ngp_iand_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<UInt32>, _ b: UnsafePointer<UInt32>, _ n: Int32)
 @_silgen_name("ngp_ior_u32")
-private func ngp_ior_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<UInt32>, _ b: UnsafePointer<UInt32>, _ n: Int32)
+func ngp_ior_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<UInt32>, _ b: UnsafePointer<UInt32>, _ n: Int32)
 @_silgen_name("ngp_ixor_u32")
-private func ngp_ixor_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<UInt32>, _ b: UnsafePointer<UInt32>, _ n: Int32)
+func ngp_ixor_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<UInt32>, _ b: UnsafePointer<UInt32>, _ n: Int32)
 @_silgen_name("ngp_ishl_u32")
-private func ngp_ishl_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<UInt32>, _ b: UnsafePointer<UInt32>, _ n: Int32)
+func ngp_ishl_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<UInt32>, _ b: UnsafePointer<UInt32>, _ n: Int32)
 @_silgen_name("ngp_ishr_u32")
 private func ngp_ishr_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<UInt32>, _ b: UnsafePointer<UInt32>, _ n: Int32)
 
@@ -437,12 +442,16 @@ enum ShaderExecutor {
                                  base + 2 < ubuf.count ? ubuf[base + 2] : 0,
                                  base + 3 < ubuf.count ? ubuf[base + 3] : 0)
             for l in 0..<n { vb[db + l] = v }
-        case 0x04: // LDATTR — fragment fast path reads the varying
-            // buffer directly; same values the closure returned.
+        case 0x04: // LDATTR — fast path reads the stage buffer
+            // directly; same values the closure returned. Slots past
+            // the buffer's slot count read as zero, as the vertex
+            // closure returned zero for them and the fragment closure
+            // was never asked (no OUT slot >= 8 feeds it).
             if let ap = ctx.attrPtr {
-                if a < 8 {
+                let stride = ctx.attrStride
+                if a < stride / 4 {
                     for l in 0..<n {
-                        let o = l * 32 + a * 4
+                        let o = l * stride + a * 4
                         vb[db + l] = SIMD4<Float>(ap[o], ap[o + 1], ap[o + 2], ap[o + 3])
                     }
                 } else {
@@ -454,10 +463,19 @@ enum ShaderExecutor {
                     vb[db + l] = SIMD4<Float>(v.0, v.1, v.2, v.3)
                 }
             }
-        case 0x05: // OUT — fragment fast path writes the colour buffer
-            // directly; only slot 0 is recorded there, as before.
+        case 0x05: // OUT — fast path writes the stage buffer directly.
             if let op = ctx.outPtr {
-                if d == 0 {
+                if ctx.outFull {
+                    // Vertex (v4): [lane][32], every slot recorded.
+                    if d < 8 {
+                        for l in 0..<n {
+                            let v = vb[ab + l]
+                            let o = l * 32 + d * 4
+                            op[o] = v.x; op[o + 1] = v.y; op[o + 2] = v.z; op[o + 3] = v.w
+                        }
+                    }
+                } else if d == 0 {
+                    // Fragment: [lane][4], only slot 0, as before.
                     for l in 0..<n {
                         let v = vb[ab + l]
                         let o = l * 4

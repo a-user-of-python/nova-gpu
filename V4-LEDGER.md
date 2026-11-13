@@ -56,3 +56,31 @@ the judge).
 - Expected: all v3 checksums unchanged; executor micro-benches
   improve; frame time improves in raster/vertex.
 - Status: pushed, awaiting CI.
+- CI run 43474077343: SUCCESS — all v3 checksums unchanged
+  (bit-exact through the C move) + section 8 green.
+  Bench vs refined v3 baseline: executor-fraglit 0.799 -> 0.717
+  us/warp; executor-vertlit 2.764 -> 2.090 us/warp; app-scene-lit
+  frame ~26.1 -> ~19.2 ms, fragExecCpu 17.86 -> 11.34 (host,
+  cross-run; executor micros are the tight signal).
+
+## Attempt 2 — grab unit + vertex fast paths + inline varyings + span narrowing
+- GrabUnit (NovaGPUVector.swift): per-warp wide fetch of the
+  snapshot into [lane][16] records (vec3->vec4 expansion identical
+  to the v3 closure); executor reads via attrPtr/attrStride=16.
+- Vertex outputs via outPtr + outFull ([lane][32], all slots),
+  scattered into ShadedVertex (slot 0 -> clip, 1..7 -> varyings,
+  varyings slot 0 stays zero as always). ~350 closure calls per
+  warp eliminated from the vertex stage.
+- ShadedVertex varyings: [Float] heap array -> inline VarBlock
+  (8 SIMD4s) — kills ~15k array allocations/draw + COW traffic in
+  clip copies; lerp/rasterise read through raw pointers.
+- rasteriseBody span narrowing: per-row analytic inside-interval
+  (both sign cases, hull, +2 px margin) skips certainly-outside
+  bbox pixels; the per-pixel inside test is unchanged and remains
+  the judge — drawn set provably identical.
+- Executor generalized: attrStride (fragment 32 default, vertex
+  16), outFull flag; fragment behaviour unchanged.
+- NovaGPU.maxScreenVectors = 4096 placeholder + vpuCount = 2x;
+  GPUStats.vectorsPlotted added.
+- Expected: all checksums identical; vertex stage and raster CPU
+  down. Status: pushed, awaiting CI.

@@ -87,6 +87,7 @@ struct DrawProfile {
 struct GPUStats {
     var laneOps: UInt64 = 0                 // total lane-instructions executed
     var warpsIssued: UInt64 = 0
+    var vectorsPlotted: UInt64 = 0          // v4: plot-unit vectors drawn
     var lanesPerCluster: [UInt64] = [UInt64](repeating: 0, count: NovaGPU.clusterCount)
     var trianglesIn: UInt64 = 0
     var trianglesOut: UInt64 = 0           // after clipping
@@ -213,6 +214,13 @@ final class NovaGPU {
     static var clusterCount = 48
     static let lanesPerCluster = 32
     static var computeUnits: Int { clusterCount * lanesPerCluster }   // 1536 at default
+    /// v4 vector hardware sizing. MAX_SCREEN_VECTORS is the plot
+    /// unit's per-frame on-screen vector budget — a placeholder
+    /// (4096) until Sean fixes the on-screen vector number; change
+    /// it here, in exactly one place. The VPU pool is sized at
+    /// 2 × that budget (double-capacity headroom).
+    static let maxScreenVectors = 4096       // MAX_SCREEN_VECTORS
+    static var vpuCount: Int { 2 * maxScreenVectors }   // VPU_COUNT = 8192
     static let vramSize: UInt64 = 2 * 1024 * 1024 * 1024       // 2 GiB
     static let blockSize = 65536                               // sparse commit granularity
 
@@ -589,11 +597,40 @@ final class NovaGPU {
 
     // MARK: - 3D pipeline
 
+    /// Varyings storage (v4): 8 vec4 slots held INLINE in the
+    /// vertex. v3 heap-allocated a 32-float Swift array per vertex
+    /// (~15k allocations per draw on the app scene) and paid array
+    /// refcount/COW traffic on every clip-stage copy; the inline
+    /// block copies as plain bytes. Layout contract: slot s
+    /// component c is float s*4 + c of the block, slots 0..7; the
+    /// eight SIMD4 properties are contiguous (each 16 bytes,
+    /// 16-aligned — no padding), guarded by the framebuffer
+    /// checksum tests, which render through these pointers.
+    /// (Slot 0 is never written — OUT 0 is the clip position.)
+    struct VarBlock {
+        var s0 = SIMD4<Float>()
+        var s1 = SIMD4<Float>()
+        var s2 = SIMD4<Float>()
+        var s3 = SIMD4<Float>()
+        var s4 = SIMD4<Float>()
+        var s5 = SIMD4<Float>()
+        var s6 = SIMD4<Float>()
+        var s7 = SIMD4<Float>()
+        func withFloats<R>(_ body: (UnsafePointer<Float>) -> R) -> R {
+            withUnsafePointer(to: self) { p in
+                body(UnsafeRawPointer(p).assumingMemoryBound(to: Float.self))
+            }
+        }
+        mutating func withMutableFloats<R>(_ body: (UnsafeMutablePointer<Float>) -> R) -> R {
+            withUnsafeMutablePointer(to: &self) { p in
+                body(UnsafeMutableRawPointer(p).assumingMemoryBound(to: Float.self))
+            }
+        }
+    }
+
     private struct ShadedVertex {
         var clip: (Float, Float, Float, Float) = (0, 0, 0, 1)
-        /// Varyings, flat: slot s occupies [s*4 + 0 ... s*4 + 3], slots 0..7.
-        /// (Slot 0 is never written — OUT 0 is the clip position.)
-        var varyings: [Float] = [Float](repeating: 0, count: 32)
+        var varyings = VarBlock()
     }
 
     /// A clipped, fan-triangulated triangle with its vertices' screen
@@ -717,8 +754,26 @@ final class NovaGPU {
         DispatchQueue.concurrentPerform(iterations: warpCount) { warp in
             let base = warp * 32
             let count = min(32, vertexCount - base)
+            // v4 grab unit: fetch this warp's attributes with wide
+            // sequential loads into [lane][16] records (vec3
+            // attributes expanded to vec4 exactly as the v3 closure
+            // presented them), and let the executor read/write
+            // through raw pointers — v3 paid ~128 closure calls per
+            // warp for LDATTR and ~224 for OUT. The closures below
+            // remain as the general path and return identical
+            // values; the executor prefers the pointers.
+            let grab = UnsafeMutablePointer<Float>.allocate(capacity: 32 * GrabUnit.recordStride)
+            defer { grab.deallocate() }
+            GrabUnit.grabWarp(snapshot: vbF, base: base, count: count, into: grab)
+            let outBuf = UnsafeMutablePointer<Float>.allocate(capacity: 32 * 32)
+            outBuf.initialize(repeating: 0, count: 32 * 32)
+            defer { outBuf.deallocate() }
             var ctx = WarpContext.dummy()
             ctx.uniforms = unis
+            ctx.attrPtr = UnsafePointer(grab)
+            ctx.attrStride = GrabUnit.recordStride
+            ctx.outPtr = outBuf
+            ctx.outFull = true
             ctx.attrProvider = { lane, slot in
                 let o = (base + lane) * 12
                 switch slot {
@@ -729,22 +784,29 @@ final class NovaGPU {
                 default: return (0, 0, 0, 0)
                 }
             }
-            // Speed round 3: write straight into the shaded-vertex
-            // buffer (disjoint vertices per warp) — v2 staged through
-            // a per-warp array of 32 fresh ShadedVertex values and
-            // copied them out, ~11k array allocations per draw.
             ctx.outWriter = { lane, slot, x, y, z, w in
-                if slot == 0 { shadedPtr[base + lane].clip = (x, y, z, w) }
-                else if slot >= 1 && slot < 8 {
-                    let o = slot * 4
-                    shadedPtr[base + lane].varyings[o] = x
-                    shadedPtr[base + lane].varyings[o + 1] = y
-                    shadedPtr[base + lane].varyings[o + 2] = z
-                    shadedPtr[base + lane].varyings[o + 3] = w
+                // General path (unused while outPtr is set): fill
+                // the same outBuf the scatter below consumes, so
+                // both paths land identically.
+                if slot >= 0 && slot < 8 {
+                    let o = lane * 32 + slot * 4
+                    outBuf[o] = x; outBuf[o + 1] = y; outBuf[o + 2] = z; outBuf[o + 3] = w
                 }
             }
             let ops = ShaderExecutor.runWarp(decoded: vDecoded, lanes: count, ctx: ctx)
             perWarpOps[warp] = UInt64(ops)
+            // Scatter the warp's outputs into the shaded-vertex
+            // buffer (disjoint vertices per warp): slot 0 → clip;
+            // slots 1..7 → varyings. Varyings slot 0 stays zero,
+            // exactly as in every earlier version (OUT 0 is the
+            // clip position, never a varying).
+            for lane in 0..<count {
+                let o = lane * 32
+                shadedPtr[base + lane].clip = (outBuf[o], outBuf[o + 1], outBuf[o + 2], outBuf[o + 3])
+                shadedPtr[base + lane].varyings.withMutableFloats { dst in
+                    for i in 4..<32 { dst[i] = outBuf[o + i] }
+                }
+            }
         }
         for warp in 0..<warpCount {
             let v = perWarpOps[warp]
@@ -967,9 +1029,17 @@ final class NovaGPU {
                   a.clip.1 + (b.clip.1 - a.clip.1) * f,
                   a.clip.2 + (b.clip.2 - a.clip.2) * f,
                   a.clip.3 + (b.clip.3 - a.clip.3) * f)
-        for s in usedSlots {
-            let o = s * 4
-            for c in 0..<4 { v.varyings[o + c] = a.varyings[o + c] + (b.varyings[o + c] - a.varyings[o + c]) * f }
+        // v4: varyings are inline VarBlocks — lerp through raw
+        // pointers with the identical expression per component.
+        a.varyings.withFloats { ap in
+            b.varyings.withFloats { bp in
+                v.varyings.withMutableFloats { vp in
+                    for s in usedSlots {
+                        let o = s * 4
+                        for c in 0..<4 { vp[o + c] = ap[o + c] + (bp[o + c] - ap[o + c]) * f }
+                    }
+                }
+            }
         }
         return v
     }
@@ -985,14 +1055,16 @@ final class NovaGPU {
         // Speed round 3: interpolation reads the three vertices'
         // varyings through raw pointers — v2 subscripted the Swift
         // arrays per component (bounds check + COW check each, ~24
-        // per pixel). The buffers outlive the call (the WorkTri holds
-        // them) and are never mutated during rasterisation.
-        tri.v0.varyings.withUnsafeBufferPointer { p0 in
-            tri.v1.varyings.withUnsafeBufferPointer { p1 in
-                tri.v2.varyings.withUnsafeBufferPointer { p2 in
+        // per pixel). v4: the varyings are inline VarBlocks; the
+        // pointers address the copies inside the WorkTri, which
+        // outlives the call and is never mutated during
+        // rasterisation.
+        tri.v0.varyings.withFloats { p0 in
+            tri.v1.varyings.withFloats { p1 in
+                tri.v2.varyings.withFloats { p2 in
                     rasteriseBody(tri, width: width, y0: y0, y1: y1, depth: depth,
                                   usedSlots: usedSlots, batcher: batcher,
-                                  v0p: p0.baseAddress!, v1p: p1.baseAddress!, v2p: p2.baseAddress!)
+                                  v0p: p0, v1p: p1, v2p: p2)
                 }
             }
         }
@@ -1029,7 +1101,56 @@ final class NovaGPU {
             let e2row = (s1.0 - s0.0) * (py - s0.1)
             let b0 = s2.1 - s1.1, b1 = s0.1 - s2.1, b2 = s1.1 - s0.1
             let rowBase = y * width
-            for x in minX...maxX {
+            // v4 span narrowing: in a row, each edge function is
+            // affine in px, so the pixels satisfying each sign case
+            // (all e >= 0 / all e <= 0) form a single interval.
+            // Compute both cases' intervals from the row constants,
+            // take their hull, widen by 2 px (the interval math's
+            // rounding error is < 0.01 px at these magnitudes), and
+            // clamp to the bounding box. The per-pixel `inside`
+            // test below still decides every visited pixel with the
+            // identical expression, so the drawn set is bit-
+            // identical — only certainly-outside pixels are skipped
+            // (about half the bounding box of a typical triangle).
+            var spanLo = 0, spanHi = -1   // empty until a case lands
+            for sign: Float in [1, -1] {
+                var loF = -Float.greatestFiniteMagnitude
+                var hiF = Float.greatestFiniteMagnitude
+                var ok = true
+                // Edge constraints for this sign case: require
+                // sign * (erow - b * (px - sx)) >= 0 per edge —
+                // e0 pairs with s1.x, e1 with s2.x, e2 with s0.x,
+                // as in the per-pixel expressions below. (Unrolled:
+                // no per-row array allocation in the hot loop.)
+                if ok {
+                    let eb = sign * b0, sr = sign * e0row
+                    if eb > 0 { hiF = min(hiF, s1.0 + sr / eb) }
+                    else if eb < 0 { loF = max(loF, s1.0 + sr / eb) }
+                    else if sr < 0 { ok = false }
+                }
+                if ok {
+                    let eb = sign * b1, sr = sign * e1row
+                    if eb > 0 { hiF = min(hiF, s2.0 + sr / eb) }
+                    else if eb < 0 { loF = max(loF, s2.0 + sr / eb) }
+                    else if sr < 0 { ok = false }
+                }
+                if ok {
+                    let eb = sign * b2, sr = sign * e2row
+                    if eb > 0 { hiF = min(hiF, s0.0 + sr / eb) }
+                    else if eb < 0 { loF = max(loF, s0.0 + sr / eb) }
+                    else if sr < 0 { ok = false }
+                }
+                if !ok { continue }
+                var xLo = minX, xHi = maxX
+                if loF > -1e6 { xLo = max(xLo, Int(ceilf(loF - 0.5)) - 2) }
+                if hiF < 1e6 { xHi = min(xHi, Int(floorf(hiF - 0.5)) + 2) }
+                if xLo <= xHi {
+                    if spanHi < spanLo { spanLo = xLo; spanHi = xHi }
+                    else { spanLo = min(spanLo, xLo); spanHi = max(spanHi, xHi) }
+                }
+            }
+            if spanHi < spanLo { continue }
+            for x in spanLo...spanHi {
                 let px = Float(x) + 0.5
                 let e0 = e0row - b0 * (px - s1.0)
                 let e1 = e1row - b1 * (px - s2.0)
