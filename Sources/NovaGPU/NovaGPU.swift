@@ -270,6 +270,44 @@ private final class FragBatcher {
     }
 }
 
+/// v6 attempt 3: a grow-only retained raw buffer. draw() and the
+/// VPU test pass need the same big scratch every call; keeping it
+/// between draws takes allocator traffic (multi-MB malloc/free,
+/// with its page churn) out of the frame. A buffer is reallocated
+/// only when a draw needs more than the retained capacity. The
+/// `deinit` closure runs over `initialized` elements before a
+/// dealloc (only ShadedVertex needs it; trivial element types use
+/// the no-op default). Contents are NOT preserved semantically:
+/// every user re-fills the whole range it reads, exactly as it
+/// did with a fresh allocation.
+private final class ScratchBox<T> {
+    private(set) var ptr: UnsafeMutablePointer<T>?
+    private(set) var capacity = 0
+    var initialized = 0
+    private let deinitFn: (UnsafeMutablePointer<T>, Int) -> Void
+    init(deinit deinitFn: @escaping (UnsafeMutablePointer<T>, Int) -> Void = { _, _ in }) {
+        self.deinitFn = deinitFn
+    }
+    func get(_ n: Int) -> UnsafeMutablePointer<T> {
+        if let p = ptr, capacity >= n { return p }
+        release()
+        let cap = max(n, 1)
+        let p = UnsafeMutablePointer<T>.allocate(capacity: cap)
+        ptr = p
+        capacity = cap
+        return p
+    }
+    func release() {
+        if let p = ptr {
+            if initialized > 0 { deinitFn(p, initialized) }
+            p.deallocate()
+        }
+        ptr = nil
+        capacity = 0
+        initialized = 0
+    }
+}
+
 final class NovaGPU {
     /// Architectural cluster count (v4: configurable). Set before
     /// creating a device; the default is the architecture's defining
@@ -521,6 +559,7 @@ final class NovaGPU {
         allocations.removeAll()
         vramReserved = 0
         stats.reset()
+        releaseScratch()
         vpuTestEnabled = false
         vpuTest = VPUTestResult()
         vpuTestLifetime = VPUTestResult()
@@ -600,6 +639,36 @@ final class NovaGPU {
     /// On is the intended v6 behaviour: allocation churn leaves
     /// the frame. Off restores the v5 allocate-per-draw behaviour.
     var scratchRetentionEnabled = true
+
+    // The retained scratch itself (attempt 3): draw()'s snapshots,
+    // shaded-vertex buffer, depth buffer and per-stage stat
+    // arrays, plus the VPU test pass's buffers. Freed wholesale by
+    // releaseScratch() — from reset(), and at draw() entry
+    // whenever retention is off, which is what makes the
+    // governor's SET_SCRATCH_RETENTION "off" a real freeing
+    // rather than a flag nobody reads.
+    private let scratchVB = ScratchBox<Float>()
+    private let scratchIB = ScratchBox<UInt32>()
+    private let scratchShaded = ScratchBox<ShadedVertex>(deinit: { p, n in p.deinitialize(count: n) })
+    private let scratchWarpOps = ScratchBox<UInt64>()
+    private let scratchDepth = ScratchBox<Float>()
+    private let scratchChunkOps = ScratchBox<UInt64>()
+    private let scratchChunkFrags = ScratchBox<UInt64>()
+    private let scratchChunkWarps = ScratchBox<UInt64>()
+    private let scratchChunkExec = ScratchBox<Double>()
+    private let scratchRefClip = ScratchBox<Float>()
+    private let scratchVPUOut = ScratchBox<Float>()
+    private let scratchRangeMism = ScratchBox<Int>()
+    private let scratchRangeErr = ScratchBox<Float>()
+
+    func releaseScratch() {
+        scratchVB.release(); scratchIB.release(); scratchShaded.release()
+        scratchWarpOps.release(); scratchDepth.release()
+        scratchChunkOps.release(); scratchChunkFrags.release()
+        scratchChunkWarps.release(); scratchChunkExec.release()
+        scratchRefClip.release(); scratchVPUOut.release()
+        scratchRangeMism.release(); scratchRangeErr.release()
+    }
 
     /// concurrentPerform with an optional width cap: iterations
     /// run in consecutive groups of at most `width`, each group
@@ -894,18 +963,25 @@ final class NovaGPU {
 
         var prof = DrawProfile()
         let pT0 = Self.nowMs()
+        // v6 attempt 3: one scratch decision per draw. Retention
+        // off hands any retained buffers back at this entry point
+        // and the draw allocates exactly as v5 did.
+        let useScratch = scratchRetentionEnabled
+        if !useScratch { releaseScratch() }
         // ---- Buffer snapshots: one locked read each (v1 fetched the
         // vertex buffer one float and the index buffer one word at a
         // time through the lock).
-        let vbFloats = UnsafeMutablePointer<Float>.allocate(capacity: max(vertexCount * 12, 1))
-        defer { vbFloats.deallocate() }
+        let vbFloats = useScratch ? scratchVB.get(max(vertexCount * 12, 1))
+                                  : UnsafeMutablePointer<Float>.allocate(capacity: max(vertexCount * 12, 1))
+        defer { if !useScratch { vbFloats.deallocate() } }
         vramRead(at: vertexBuffer, count: vertexCount * 48).withUnsafeBufferPointer { src in
             if let sp = src.baseAddress, vertexCount > 0 {
                 memcpy(vbFloats, sp, vertexCount * 48)
             }
         }
-        let ibWords = UnsafeMutablePointer<UInt32>.allocate(capacity: max(idxCount, 1))
-        defer { ibWords.deallocate() }
+        let ibWords = useScratch ? scratchIB.get(max(idxCount, 1))
+                                 : UnsafeMutablePointer<UInt32>.allocate(capacity: max(idxCount, 1))
+        defer { if !useScratch { ibWords.deallocate() } }
         vramRead(at: indexBuffer, count: idxCount * 4).withUnsafeBufferPointer { src in
             if let sp = src.baseAddress, idxCount > 0 {
                 memcpy(ibWords, sp, idxCount * 4)
@@ -913,13 +989,18 @@ final class NovaGPU {
         }
 
         // ---- Vertex stage: one warp per 32 vertices, warps over clusters.
-        let shadedPtr = UnsafeMutablePointer<ShadedVertex>.allocate(capacity: max(vertexCount, 1))
-        shadedPtr.initialize(repeating: ShadedVertex(), count: max(vertexCount, 1))
-        defer { shadedPtr.deinitialize(count: max(vertexCount, 1)); shadedPtr.deallocate() }
+        let shadedCount = max(vertexCount, 1)
+        let shadedPtr = useScratch ? scratchShaded.get(shadedCount)
+                                   : UnsafeMutablePointer<ShadedVertex>.allocate(capacity: shadedCount)
+        shadedPtr.initialize(repeating: ShadedVertex(), count: shadedCount)
+        if useScratch { scratchShaded.initialized = shadedCount }
+        defer { if !useScratch { shadedPtr.deinitialize(count: shadedCount); shadedPtr.deallocate() } }
         let warpCount = (vertexCount + 31) / 32
-        let perWarpOps = UnsafeMutablePointer<UInt64>.allocate(capacity: max(warpCount, 1))
-        perWarpOps.initialize(repeating: 0, count: max(warpCount, 1))
-        defer { perWarpOps.deinitialize(count: max(warpCount, 1)); perWarpOps.deallocate() }
+        let warpOpsCount = max(warpCount, 1)
+        let perWarpOps = useScratch ? scratchWarpOps.get(warpOpsCount)
+                                    : UnsafeMutablePointer<UInt64>.allocate(capacity: warpOpsCount)
+        perWarpOps.initialize(repeating: 0, count: warpOpsCount)
+        defer { if !useScratch { perWarpOps.deinitialize(count: warpOpsCount); perWarpOps.deallocate() } }
         prof.snapshotMs = Self.nowMs() - pT0
         let pV0 = Self.nowMs()
         let vbF = vbFloats
@@ -1080,9 +1161,10 @@ final class NovaGPU {
         // z, so a LARGER NDC z is NEARER the viewer. The buffer clears
         // to -1 (below the [0, 1] clip range) and the test keeps the
         // greater z (see rasterise).
-        let depthPtr = UnsafeMutablePointer<Float>.allocate(capacity: width * height)
+        let depthPtr = useScratch ? scratchDepth.get(width * height)
+                                  : UnsafeMutablePointer<Float>.allocate(capacity: width * height)
         depthPtr.initialize(repeating: -1.0, count: width * height)
-        defer { depthPtr.deinitialize(count: width * height); depthPtr.deallocate() }
+        defer { if !useScratch { depthPtr.deinitialize(count: width * height); depthPtr.deallocate() } }
         let fbBlocks = blockPointers(addr: framebuffer, size: fbAllocSize)
         let fbFirstBlock = blockIndex(framebuffer)
         let fb = framebuffer
@@ -1112,17 +1194,23 @@ final class NovaGPU {
         }
         prof.binMs = Self.nowMs() - pB0
         let pR0 = Self.nowMs()
-        let chunkOps = UnsafeMutablePointer<UInt64>.allocate(capacity: chunkCount)
-        let chunkFrags = UnsafeMutablePointer<UInt64>.allocate(capacity: chunkCount)
-        let chunkWarps = UnsafeMutablePointer<UInt64>.allocate(capacity: chunkCount)
-        let chunkExec = UnsafeMutablePointer<Double>.allocate(capacity: chunkCount)
+        let chunkOps = useScratch ? scratchChunkOps.get(chunkCount)
+                                  : UnsafeMutablePointer<UInt64>.allocate(capacity: chunkCount)
+        let chunkFrags = useScratch ? scratchChunkFrags.get(chunkCount)
+                                    : UnsafeMutablePointer<UInt64>.allocate(capacity: chunkCount)
+        let chunkWarps = useScratch ? scratchChunkWarps.get(chunkCount)
+                                    : UnsafeMutablePointer<UInt64>.allocate(capacity: chunkCount)
+        let chunkExec = useScratch ? scratchChunkExec.get(chunkCount)
+                                   : UnsafeMutablePointer<Double>.allocate(capacity: chunkCount)
         for p in [chunkOps, chunkFrags, chunkWarps] { p.initialize(repeating: 0, count: chunkCount) }
         chunkExec.initialize(repeating: 0, count: chunkCount)
         defer {
-            for p in [chunkOps, chunkFrags, chunkWarps] {
-                p.deinitialize(count: chunkCount); p.deallocate()
+            if !useScratch {
+                for p in [chunkOps, chunkFrags, chunkWarps] {
+                    p.deinitialize(count: chunkCount); p.deallocate()
+                }
+                chunkExec.deinitialize(count: chunkCount); chunkExec.deallocate()
             }
-            chunkExec.deinitialize(count: chunkCount); chunkExec.deallocate()
         }
 
         fbBlocks.withUnsafeBufferPointer { fbTable in
@@ -1198,17 +1286,20 @@ final class NovaGPU {
                                 uniforms unis: [Float],
                                 shaded shadedPtr: UnsafeMutablePointer<ShadedVertex>) {
         let t0 = Self.nowMs()
+        let useScratch = scratchRetentionEnabled
         // Pristine reference: the shader stage's clip positions,
         // copied before any gather write can touch them.
-        let refClip = UnsafeMutablePointer<Float>.allocate(capacity: max(vertexCount, 1) * 4)
-        defer { refClip.deallocate() }
+        let refClip = useScratch ? scratchRefClip.get(max(vertexCount, 1) * 4)
+                                 : UnsafeMutablePointer<Float>.allocate(capacity: max(vertexCount, 1) * 4)
+        defer { if !useScratch { refClip.deallocate() } }
         for v in 0..<vertexCount {
             let c = shadedPtr[v].clip
             refClip[v * 4] = c.0; refClip[v * 4 + 1] = c.1
             refClip[v * 4 + 2] = c.2; refClip[v * 4 + 3] = c.3
         }
-        let out = UnsafeMutablePointer<Float>.allocate(capacity: triCount * 12)
-        defer { out.deallocate() }
+        let out = useScratch ? scratchVPUOut.get(triCount * 12)
+                             : UnsafeMutablePointer<Float>.allocate(capacity: triCount * 12)
+        defer { if !useScratch { out.deallocate() } }
         let ranges = MGVPU.subRanges(count: triCount)
         var clusters = 0
         for r in ranges where r.1 > r.0 { clusters += 1 }
@@ -1223,13 +1314,17 @@ final class NovaGPU {
         // against the pristine reference. Per-range counters are
         // reduced serially afterwards.
         let fault = Self.vpuTestFault
-        let rangeMism = UnsafeMutablePointer<Int>.allocate(capacity: ranges.count)
-        let rangeErr = UnsafeMutablePointer<Float>.allocate(capacity: ranges.count)
+        let rangeMism = useScratch ? scratchRangeMism.get(ranges.count)
+                                   : UnsafeMutablePointer<Int>.allocate(capacity: ranges.count)
+        let rangeErr = useScratch ? scratchRangeErr.get(ranges.count)
+                                  : UnsafeMutablePointer<Float>.allocate(capacity: ranges.count)
         rangeMism.initialize(repeating: 0, count: ranges.count)
         rangeErr.initialize(repeating: 0, count: ranges.count)
         defer {
-            rangeMism.deinitialize(count: ranges.count); rangeMism.deallocate()
-            rangeErr.deinitialize(count: ranges.count); rangeErr.deallocate()
+            if !useScratch {
+                rangeMism.deinitialize(count: ranges.count); rangeMism.deallocate()
+                rangeErr.deinitialize(count: ranges.count); rangeErr.deallocate()
+            }
         }
         unis.withUnsafeBufferPointer { ub in
             let mPtr = ub.baseAddress!
