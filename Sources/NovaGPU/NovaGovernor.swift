@@ -41,6 +41,22 @@
 
 import Foundation
 
+/// Precise wait until a deadline on the NovaGPU.nowMs() clock:
+/// a coarse Thread.sleep for the bulk, then a short spin for the
+/// last stretch. The v6 bench convicted the plain sleep: on the
+/// CI host its overshoot (waking 1–8 ms late on a loaded runner)
+/// ADDED more frame-interval variance than the pacing removed,
+/// so the pacer sleeps only down to the last ~1 ms and spins the
+/// remainder — one busy core for at most that stretch, in
+/// exchange for a deadline kept to ~0.1 ms.
+func governorWait(untilMs deadline: Double, spinMs: Double = 1.0) {
+    let remaining = deadline - NovaGPU.nowMs()
+    if remaining > spinMs + 0.5 {
+        Thread.sleep(forTimeInterval: (remaining - spinMs) / 1000)
+    }
+    while NovaGPU.nowMs() < deadline { }
+}
+
 /// One frame's telemetry, sampled at a frame boundary. Filled by
 /// the bus device on every PRESENT (the inter-present interval is
 /// the frame pacing the guest actually experiences) or by a host
@@ -97,7 +113,11 @@ final class NovaGovernor {
     static let grainMax = 8
     static let sliceTargetMs = 2.0                   // CPU slice wall steered toward
     static let sliceMin: UInt64 = 10_000
-    static let sliceMax: UInt64 = 400_000
+    // Capped at 200k after the attempt-2 proof log: at 400k the
+    // slice's own wall hit 3.1 ms and every GPU service point the
+    // driver waited on paid the longer latency — the cap keeps a
+    // slice inside roughly one target band on the M-class host.
+    static let sliceMax: UInt64 = 200_000
     static let sliceDefault: UInt64 = 100_000        // the v5 proof slice
     static let scratchShedBytes = 256 * 1024 * 1024  // VRAM commit level that sheds scratch
     static let scratchRestoreBytes = 128 * 1024 * 1024
