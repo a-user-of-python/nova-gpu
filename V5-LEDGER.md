@@ -174,7 +174,12 @@ in this ledger as a proposed trade and NOT shipped.
   path.
 - Expected: work list value-identical (host checksums are the
   gate); clip stage ms down.
-- Status: pushed, awaiting CI.
+- CI run 43487263758: **host tests + bench SUCCESS** — all
+  checksums held. Measured (HOST): clip stage 2.30 → 0.81 ms
+  (app-scene-lit), 2.32 → 0.87 (v4vert), 1.82 → 0.82 (nofrag),
+  2.30 → 0.92 (flatfrag) — attempt-3 run vs attempt-4 run, the
+  same ~2.5× reduction in all four variants. App-scene frame
+  13.2 ms on this (healthy) runner. Attempt 4 DONE.
 
 ## Attempt 2 plan (as written before implementation)
 - Wide calculator issue: grabbed triangle records are positioned
