@@ -1,6 +1,6 @@
 # NovaGPU v6 — attempt ledger
 
-Commission (Sean, 2026-11-13 15:59 ET), after device-testing v5:
+Commission (2026-11-13 15:59 ET), after device-testing v5:
 "with the vpus I get roughly 35 [FPS] but the fps is all over the
 place — see if you can stabilize it with a new thing I want to
 introduce to both projects. For now this will be only on the gpu
@@ -15,14 +15,14 @@ but not just memory. This chip should help increase performance on
 both ends." Plus: "increase gpu performance and cpu performance in
 the gpu app so we can try to hit 60fps on the test scene."
 
-Device anchor: **v5 with the VPU test armed ≈ 35 FPS on Sean's
+Device anchor: **v5 with the VPU test armed ≈ 35 FPS on the
 iPad Air M3, unstable** ("all over the place"). v3 baseline on the
 same scene (icosphere + torus, 640×480, 29,696 tris) was ~27 FPS.
 Stabilizing the frame rate is a headline goal alongside raw speed.
 
 ## The chip (working name `NovaGovernor`)
 
-Sean names his hardware: the name lives in exactly ONE place
+Renaming: the name lives in exactly ONE place
 (`NovaGovernor.chipName`) so he can rename it with one edit.
 
 A first-class device, not app glue:
@@ -70,7 +70,7 @@ host-test section 13 proves frame equality across knob settings.
 60 FPS honesty: the target is 60 on the test scene. Host numbers
 are labelled host; whatever the host lands at, BENCH-v6.md says
 where it landed and what the remaining sink is. The device
-verdict is Sean's.
+verdict is the tester's.
 
 ## Attempt 0 — measurement + governor-ready knobs (no behaviour change)
 - NovaGPU gains instance knobs with v5 defaults: `rasterChunkRows`
@@ -185,5 +185,5 @@ verdict is Sean's.
   contain the v6 paths (NovaGovernor, SET_PACE_TIER /
   SET_RASTER_GRAIN / SET_CPU_SLICE, governorWait symbol, the
   supervisor toggle label).
-- Status: DONE. Device verdict owed from Sean (test steps in
+- Status: DONE. Device verdict owed from the tester (test steps in
   the delivery note).
