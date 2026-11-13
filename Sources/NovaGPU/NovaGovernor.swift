@@ -1,6 +1,6 @@
 // NovaGovernor.swift — the v6 supervisor chip.
 //
-// Sean's design (2026-11-13): "a new chip that is very basic. It
+// Design brief (2026-11-13): "a new chip that is very basic. It
 // has 1 goal which is to maintain the gpu and cpu to its best
 // ability. It will change the gpu and cpu priority (what would be
 // amount of power in real life) and can change memory allocation
@@ -91,9 +91,9 @@ struct GovernorAction {
 }
 
 final class NovaGovernor {
-    /// The chip's name. Sean names his hardware — this is the ONE
-    /// place the name lives; rename it here and the register
-    /// banner, HUD and logs follow.
+    /// The chip's name, kept in exactly ONE place so it can be
+    /// renamed with a single edit; the register banner, HUD and
+    /// logs all read it from here.
     static let chipName = "NovaGovernor"
 
     // MARK: Policy constants (the whole policy is these + tick())
