@@ -29,6 +29,38 @@ GPU source code — is `NovaGPU-Design.md` in the project deliverables.
 NovaGPU ships standalone first; it merges into NovaVM as Nova v0.1
 later (the bus is the compatibility contract for that merge).
 
+## v4 — optimisation + vector hardware
+
+- **Hot core completed in C**: every shader-executor op now runs
+  in the NEON C core under the same FP exactness contract (one
+  rounding per op, accumulation order unchanged) — all v3
+  framebuffer checksums pass unchanged. Plus: a **grab unit**
+  (wide vertex fetch, no per-lane closures), allocation-free
+  inline varyings, and analytic rasteriser span narrowing. Host
+  (CI) executor micro-benches vs v3: fragment warp 0.80 → 0.72 µs,
+  vertex warp 2.76 → 2.09 µs. The device baseline is v3 at ~27 FPS
+  on Sean's iPad Air M3; the v4 device verdict is his to measure.
+  Full record: `BENCH-v4.md`.
+- **Vector unit ISA** (appended, nothing renumbered): VCROSS
+  (0x1E), VNORM (0x1F), VMAT4 (0x24) — FP32 world-space vector
+  math, bit-exact against the DOT-row expressions they replace.
+  `NovaGPUStandard.vertexLitProgramV4()` renders byte-identical
+  frames to the v1 program.
+- **VPU + MGVPU clusters**: a VPU positions one triangle (3
+  grabbed vertices, 9 axis values, one 3-axis calculator). The
+  pool is grouped into 50 **MGVPU** clusters of 131,072 VPUs —
+  6,553,600 addressable VPUs, virtual and demand-materialized
+  (zero idle cost); scheduling distributes MGVPU sub-ranges
+  across host threads.
+- **Plot unit**: bus command 19 plots 3D vectors as lines/points
+  without the triangle pipeline — grab, VPU-position, project to
+  the 16-bit-per-axis screen grid (Q10.6), DDA-rasterise with
+  triangle depth rules, shade through the bound fragment program
+  (colour = uniform c10 in varying slot 1). Budget: 65,536
+  vectors per frame. The test app gains a **Vectors** page
+  (wireframe cube + corner points, plot unit only). Host tests
+  prove plotted pixel sets against a Double-precision reference.
+
 ## Layout
 
 - `Sources/NovaGPU/` — the GPU core (shader ISA + executor, the GPU,

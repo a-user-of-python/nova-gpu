@@ -156,3 +156,21 @@ the judge).
 - Executor micros in that CI run read 1.43/3.20 us/warp vs
   0.72/2.09 in the healthier step-A run — shared-runner noise;
   only same-run comparisons are cited anywhere.
+
+## Final — CI run 43478322398 SUCCESS; IPA delivered
+- All jobs green: host tests (incl. sections 8/9/10 exactness),
+  CPU proof, bench, build-ipa.
+- Plot saturation (pixel-step DDA): 1,024 vec = 13.2 ms;
+  8,192 = 90.5; 32,768 = 269.6; 65,536 (full budget) = 476.8 ms
+  shading 15.66M real fragments; us/vector falls with scale
+  (MGVPU-parallel path). Same-run v4vert A/B within noise at
+  scene level; executor micros carry the proven gains.
+- Deliverable: NovaGPU-Test-v4.ipa, 210,258 bytes, md5
+  b5ee86aba9e7a55e1fdeb974efd13b0e, bundle com.user.novagputest,
+  copied to ~/workspace/your_files/.
+- Bit-exactness: NO change anywhere. All v3 framebuffer
+  checksums pass unchanged; new ops proven bit-exact against
+  same-expression references; VMAT4 program frame byte-identical
+  to v1; parallel plot byte-identical to serial plot.
+- Device verdict pending: Sean re-runs the Live Scene (his
+  ~27 FPS v3 reading) + the new Vectors page on the iPad Air M3.
