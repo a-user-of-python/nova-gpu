@@ -163,7 +163,7 @@ func runDriver(governed: Bool) -> DriverRun {
         repeat {
             let slice = gov.chip.cpuSliceSteps
             let s0 = Date()
-            cpu.run(maxSteps: Int(slice))
+            cpu.run(maxSteps: slice)
             let sliceMs = Date().timeIntervalSince(s0) * 1000
             budget += slice
             slices += 1
