@@ -594,6 +594,12 @@ final class NovaGPU {
     /// the host the GPU stages may occupy at once). 0 = uncapped —
     /// DispatchQueue.concurrentPerform exactly as v5 ran it.
     var stageWidth = 0
+    /// v6: whether draw() may retain its big scratch buffers
+    /// between draws (the governor's SET_SCRATCH_RETENTION; the
+    /// scratch cache that consumes this flag lands in attempt 3).
+    /// On is the intended v6 behaviour: allocation churn leaves
+    /// the frame. Off restores the v5 allocate-per-draw behaviour.
+    var scratchRetentionEnabled = true
 
     /// concurrentPerform with an optional width cap: iterations
     /// run in consecutive groups of at most `width`, each group
