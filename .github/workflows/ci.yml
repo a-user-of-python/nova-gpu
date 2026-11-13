@@ -32,6 +32,7 @@ jobs:
             Sources/NovaGPU/NovaBus.swift \
             Sources/NovaGPU/NovaBusClient.swift \
             Sources/NovaGPU/NovaGPUStandard.swift \
+            Sources/NovaGPU/NovaGovernor.swift \
             build/NovaGPUFast.o
       - name: Run bus host tests
         run: |
@@ -50,6 +51,7 @@ jobs:
             Sources/NovaGPU/NovaBus.swift \
             Sources/NovaGPU/NovaBusClient.swift \
             Sources/NovaGPU/NovaGPUStandard.swift \
+            Sources/NovaGPU/NovaGovernor.swift \
             build/NovaGPUFast.o
       - name: Run CPU proof
         run: |
@@ -82,6 +84,7 @@ jobs:
             Sources/NovaGPU/NovaBus.swift \
             Sources/NovaGPU/NovaBusClient.swift \
             Sources/NovaGPU/NovaGPUStandard.swift \
+            Sources/NovaGPU/NovaGovernor.swift \
             build/NovaGPUFast.o
       - name: Run benchmarks
         run: |
