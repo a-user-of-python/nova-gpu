@@ -47,7 +47,7 @@ final class GPUEngine: ObservableObject {
     private var govWanted = false   // queue-confined
     private var govSent = false     // queue-confined: state last sent over the ring
     private var governor: NovaGovernorDevice?
-    private var paceNextStart: Date?
+    private var paceNextStartMs: Double = 0   // NovaGPU.nowMs() clock; 0 = unset
 
     /// The governor toggle: enable/disable travel over the bus
     /// (ring opcode 21) at the top of the next frame batch, and
@@ -151,15 +151,15 @@ final class GPUEngine: ObservableObject {
         // now (no catch-up debt). The sleep is before t0, so
         // frameMs below still measures work, not pacing.
         if govWanted, let gov = governor {
-            let interval = gov.chip.paceTargetMs / 1000
-            let tickNow = Date()
-            if let next = paceNextStart, tickNow < next {
-                Thread.sleep(forTimeInterval: next.timeIntervalSince(tickNow))
+            let interval = gov.chip.paceTargetMs
+            let now = NovaGPU.nowMs()
+            if paceNextStartMs > 0, now < paceNextStartMs {
+                governorWait(untilMs: paceNextStartMs)
             }
-            let start = Date()
-            paceNextStart = max(start, paceNextStart ?? start).addingTimeInterval(interval)
+            let start = NovaGPU.nowMs()
+            paceNextStartMs = max(start, paceNextStartMs) + interval
         } else {
-            paceNextStart = nil
+            paceNextStartMs = 0
         }
         let t0 = Date()
         do {
