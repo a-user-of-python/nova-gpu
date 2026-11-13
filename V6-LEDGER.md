@@ -114,7 +114,8 @@ verdict is Sean's.
   toward its target band), pixel invariance across knob settings.
 - CI workflow + Xcode project gain the new source file.
 - Expected: all pre-v6 checksums unchanged; section 13 green.
-- Status: implemented; CI pending.
+- Measured: CI 43509439822 all green; §13 fully PASS (see
+  BENCH-v6.md). Status: DONE.
 
 ## Attempt 2 — app integration
 - GPUEngine (Live Scene): governor created + attached + supervising
@@ -130,9 +131,16 @@ verdict is Sean's.
   the full checks (GPU OK + framebuffer match) applied to BOTH.
 - Expected: proof + host tests green; the proof page and CI print
   both wall times and the governor's actions.
-- Status: implemented (one compile fix on the way: NovaCPU.run
-  takes maxSteps as UInt64 — the two slice loops now pass the
-  chip's UInt64 directly); CI pending with attempt 3.
+- Measured: CI 43512829206 all green after the UInt64 fix. The
+  bench A/B convicted the first pacer: Thread.sleep overshoot
+  made governed intervals WORSE on the host (stdev 9.87 vs 2.12
+  unpaced) while every chip command fired correctly. Pacer
+  rebuilt as governorWait (sleep to the last ~1 ms, then spin),
+  shared verbatim by the app and the bench; slice cap lowered
+  400k → 200k from the proof log. Proof A/B honestly recorded
+  in BENCH-v6.md (supervised run slower on wall at toy scale —
+  mechanism proven, no wall claim).
+- Status: DONE (pacer re-measurement lands in attempt 4's run).
 
 ## Attempt 3 — draw() scratch reuse (allocation churn)
 - draw() allocates and re-initializes its big scratch every call
@@ -155,7 +163,8 @@ verdict is Sean's.
   v5. reset() releases it too. plotVectors keeps the v5
   allocate-per-call behaviour deliberately (the Vectors scene is
   20 vectors; it is not the frame path under test).
-- Status: implemented; CI pending.
+- Measured: CI 43512829206 all green; same-run A/B 13.09 ms
+  (on) vs 13.31 ms (off) — see BENCH-v6.md. Status: DONE.
 
 ## Attempt 4 — defaults from evidence + close-out
 - Shipped defaults for grain/width set from the attempt-0 sweeps;
@@ -163,3 +172,5 @@ verdict is Sean's.
 - Final CI, IPA binary verified to contain the governor paths,
   README v6 section (the chip in plain language), BENCH-v6.md,
   this ledger completed, NOVA tracking entry.
+- Status: in progress (governorWait pacer + slice cap are the
+  last code changes; this attempt's CI run is the final gate).
