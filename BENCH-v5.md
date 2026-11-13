@@ -71,3 +71,25 @@ CU sweep: NOT re-convicting anything — this run's sweep is
 runner-load garbage (24 → 40.2, 48 → 52.0, 96 → 66.2 ms, while
 the same run's own app scene at 48 clusters read 25.5 ms).
 1536 CUs stay, per v4's cleaner sweeps.
+
+## Attempt 1 — in-scene VPU test (CI run 43482787469, all green)
+
+Host-test section 11 (the test's own verdict): armed frames are
+byte-identical to unarmed on the cube AND the sphere; counts
+exact (cube 12 tris / 36 corners / 12 clusters; sphere 20,480
+tris / 50 clusters; 0 mismatches, max error 0.0 everywhere,
+including against the v1 vertex program). The fault hook
+(+0.5 on corner-0 clip x) is detected at exactly 12 mismatched
+corners with max error 0.5, and the faulted frame differs from
+the clean frame — the test can fail, loudly, and armed frames
+really render from VPU positions. (The first attempt-1 run
+caught the compare reading a gather-contaminated reference —
+6 of 12 fault corners masked; the pass now compares against a
+pristine snapshot of the shader clips. See V5-LEDGER.)
+
+Same-run scene A/B (this run): unarmed `app-scene-lit-v4vert`
+19.56 ms vs armed `app-scene-vputest` 19.21 ms — the pass's own
+accounting totals 16.50 ms over 8 frames (≈2.1 ms/frame,
+14.4M triangles/s through grab + calculator + compare), a cost
+inside this run's scene-to-scene noise. VPU micro same run:
+51.4M tri/s serial, 99.3M tri/s MGVPU-parallel.
