@@ -44,7 +44,7 @@ func uploadMesh(_ gpu: NovaGPU, _ m: NovaGPUStandard.Mesh) throws -> (UInt64, UI
 /// Runs the app scene (icosphere 5 + torus, 640x480, lit programs)
 /// for `frames` frames on a fresh device built with the current
 /// NovaGPU.clusterCount; returns per-frame wall + profile medians.
-func appScene(frames: Int, vProg: [UInt32], fProg: [UInt32]) throws
+func appScene(frames: Int, vProg: [UInt32], fProg: [UInt32], vpuTest: Bool = false) throws
     -> (frame: Double, prof: DrawProfile, frags: Double) {
     let gpu = NovaGPU()
     let fbW = 640, fbH = 480
@@ -52,6 +52,7 @@ func appScene(frames: Int, vProg: [UInt32], fProg: [UInt32]) throws
     gpu.framebuffer = fb; gpu.fbWidth = fbW; gpu.fbHeight = fbH
     gpu.vertexProgram = vProg
     gpu.fragmentProgram = fProg
+    if vpuTest { gpu.armVPUTest(true) }
     let sphere = NovaGPUStandard.icosphere(subdivisions: 5)
     let torus = NovaGPUStandard.torus(rings: 96, slices: 48)
     let (sv, si) = try uploadMesh(gpu, sphere)
@@ -93,6 +94,13 @@ func appScene(frames: Int, vProg: [UInt32], fProg: [UInt32]) throws
         profs.append(sum)
         fragCounts.append(Double(gpu.stats.fragmentsShaded - fragsBefore))
     }
+    if vpuTest {
+        let t = gpu.vpuTest
+        bench("vputest-result triangles=\(t.trianglesTested) corners=\(t.cornersCompared) " +
+              "mismatches=\(t.mismatches) maxErr=\(t.maxAbsError) " +
+              "passMs_total=\(ms(t.passMs)) clusters=\(t.clustersEngaged) " +
+              "tri_s=\(ms(t.trianglesPerSecond))")
+    }
     // Drop the first frame (warm-up: block commits, allocator, caches).
     let p = Array(profs.dropFirst())
     var med = DrawProfile()
@@ -128,6 +136,12 @@ do {
     //     the vertex stage against the v1 program above.
     let appV4 = try appScene(frames: 8, vProg: vsLitV4, fProg: fsLit)
     reportScene("app-scene-lit-v4vert", appV4)
+
+    // 1e. v5: the app scene with the VPU test armed — draws render
+    //     FROM the VPU positions; this is the frame cost of the
+    //     in-scene test (same-run A/B vs app-scene-lit-v4vert).
+    let appT = try appScene(frames: 8, vProg: vsLitV4, fProg: fsLit, vpuTest: true)
+    reportScene("app-scene-vputest", appT)
 
     // 1b. Executor floor: fragment program is a bare END (default
     //     colour out) — raster wall then holds coverage +
