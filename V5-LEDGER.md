@@ -112,6 +112,40 @@ in this ledger as a proposed trade and NOT shipped.
   sizes 1 / 7 / 1024). Bench: vpu-micro-wide A/B.
 - Expected: section 9c/9d/9e pixel-exactness unchanged; test
   pass tri/s up from 14.4M; plot pass-1 ms down at all scales.
+- CI run 43484455833: **host tests + bench SUCCESS** (all host
+  tests pass — 9f batch invariance at 1/7/1024, section 12 wide
+  bitwise proof, sections 9/11 unchanged).
+  Measured (HOST, same-run micro A/B): vpu-micro-wide serial
+  **140.4M tri/s** vs per-triangle 52.6M — **2.67×** for the
+  same grab + position work; parallel wide 135.6M ≈ serial
+  (0.2 ms scale: dispatch overhead saturates). In-scene test
+  pass: **27.5M tri/s** (from 14.4M), ≈1.08 ms/frame at the
+  app scene's 29,696 triangles. Plot pass 1: 65,536-vector
+  total 625.8 ms vs 666.1 in the attempt-1 run, pass 1 379 vs
+  387 — inside cross-run noise; the honest read is the wide
+  issue's plot effect is small (pass 1 is Swift bookkeeping-
+  bound, not calculator-call-bound) and its VPU effect is
+  large. Threshold sweep, same run: at 65,536 vectors the
+  minimum is exactly threshold **2048** (419.5 ms; 1024 →
+  566.9, 4096 → 437.8); at 8,192, 1024 (56.8) ≈ 2048 (60.0).
+  **plotParallelThreshold stays 2048** — now sweep-backed.
+  Attempt 2 DONE.
+
+## Attempt 3 — C fragment writeback
+- Change: `ngp_flush_writeback` (C) takes over FragBatcher
+  flush's conversion + block-table write: identical min/max
+  Comparable-form clamps (NaN propagates), `t * 255` in Float,
+  truncating cast, same table rule; unwritable lanes return as
+  skip indices and replay through the original Swift
+  writePixel (locked fallback commits the block). NaN channels
+  write 0 in C — Swift trapped on UInt8(NaN), so no defined
+  output changes; documented in the header.
+- Evidence: `app-scene-nofrag` fragExecCpu 5.2–11.8 ms across
+  runs for 290,906 fragments is pure flush + writeback (the
+  nofrag program writes constants) — the writeback loop is a
+  convicted floor under every scene.
+- Expected: all framebuffer checksums byte-identical (host
+  tests are the gate); fragExecCpu down on nofrag/flatfrag.
 - Status: pushed, awaiting CI.
 
 ## Attempt 2 plan (as written before implementation)
