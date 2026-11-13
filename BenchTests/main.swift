@@ -293,18 +293,94 @@ do {
         gpu.setUniform(index: 10, (0.25, 1.0, 0.35, 1.0))
         for count in [1024, 8192, 32768, 65536] {
             var times: [Double] = []
+            var p1s: [Double] = []
+            var p2s: [Double] = []
             var frags: UInt64 = 0
             for rep in 0..<3 {
                 try gpu.clearFramebuffer(rgba: 0xFF0A0A12)
                 let fBefore = gpu.stats.fragmentsShaded
                 let t = try gpu.plotVectors(indexCount: count * 2, mode: 0)
                 times.append(t)
+                p1s.append(gpu.lastPlotProfile.pass1Ms)
+                p2s.append(gpu.lastPlotProfile.pass2Ms)
                 if rep == 2 { frags = gpu.stats.fragmentsShaded - fBefore }
             }
             let med = median(times)
             bench("plot-lines vectors=\(count) ms=\(ms(med)) " +
+                  "pass1=\(ms(median(p1s))) pass2=\(ms(median(p2s))) " +
                   "us_per_vector=\(ms(med * 1000 / Double(count))) fragments=\(frags)")
         }
+
+        // 6a. Plot parallel-threshold sweep (v5): the threshold only
+        //     gates serial vs MGVPU-cluster-parallel pass 1; find the
+        //     crossover by measurement instead of keeping v4's 2,048
+        //     by default.
+        for count in [1024, 8192, 65536] {
+            for th in [256, 512, 1024, 2048, 4096, 8192] {
+                NovaGPU.plotParallelThreshold = th
+                var times: [Double] = []
+                for _ in 0..<3 {
+                    try gpu.clearFramebuffer(rgba: 0xFF0A0A12)
+                    times.append(try gpu.plotVectors(indexCount: count * 2, mode: 0))
+                }
+                bench("plot-threshold vectors=\(count) threshold=\(th) ms=\(ms(median(times)))")
+            }
+        }
+        NovaGPU.plotParallelThreshold = 2048
+    }
+
+    // 7. VPU micro-bench (v5 baseline): position the app scene's
+    //    triangle count through the per-triangle VPU path (grab
+    //    unit -> VPU load -> 3-axis calculator), serially and split
+    //    over MGVPU sub-ranges. This is the throughput the v5
+    //    wide-issue VPU path has to beat.
+    do {
+        let tris = 29696
+        var rng: UInt64 = 0x5EED
+        func fr() -> Float {
+            rng = rng &* 6364136223846793005 &+ 1442695040888963407
+            return Float((rng >> 40) & 0xFFFFFF) / Float(0x1000000) * 2 - 1
+        }
+        let snap = UnsafeMutablePointer<Float>.allocate(capacity: tris * 36)
+        defer { snap.deallocate() }
+        for i in 0..<(tris * 36) { snap[i] = fr() }
+        let mat: [Float] = [0.8, 0.1, -0.3, 0.5, -0.2, 1.1, 0.4, -0.6,
+                            0.9, -0.7, 0.3, 0.25, -0.1, 0.2, 0.45, 1.0]
+        let out = UnsafeMutablePointer<Float>.allocate(capacity: tris * 12)
+        defer { out.deallocate() }
+        func runRange(_ lo: Int, _ hi: Int, _ mPtr: UnsafePointer<Float>) {
+            var vpu = VPU()
+            withUnsafeTemporaryAllocation(of: Float.self, capacity: 12) { s in
+                s.initialize(repeating: 0)
+                let sPtr = s.baseAddress!
+                for k in lo..<hi {
+                    GrabUnit.grabTrianglePositions(snapshot: snap, k * 3, k * 3 + 1, k * 3 + 2, into: sPtr)
+                    vpu.load(positions: sPtr)
+                    vpu.position(matrix: mPtr, into: out + k * 12)
+                }
+            }
+        }
+        var serialMs: [Double] = []
+        var parMs: [Double] = []
+        for _ in 0..<3 {
+            let t0 = NovaGPU.nowMs()
+            mat.withUnsafeBufferPointer { mp in runRange(0, tris, mp.baseAddress!) }
+            serialMs.append(NovaGPU.nowMs() - t0)
+            let ranges = MGVPU.subRanges(count: tris)
+            let t1 = NovaGPU.nowMs()
+            mat.withUnsafeBufferPointer { mp in
+                let mPtr = mp.baseAddress!
+                DispatchQueue.concurrentPerform(iterations: ranges.count) { r in
+                    runRange(ranges[r].0, ranges[r].1, mPtr)
+                }
+            }
+            parMs.append(NovaGPU.nowMs() - t1)
+        }
+        bench("vpu-micro tris=\(tris) serial_ms=\(ms(median(serialMs))) " +
+              "serial_tri_s=\(ms(Double(tris) / median(serialMs) * 1000)) " +
+              "mgvpu_parallel_ms=\(ms(median(parMs))) " +
+              "parallel_tri_s=\(ms(Double(tris) / median(parMs) * 1000)) " +
+              "first_clip=\(out[0])")
     }
 } catch {
     print("BENCH FAILED: \(error)")
