@@ -61,6 +61,14 @@ enum ProofRunner {
         cpu.memory = memory
         let device = NovaGPUDevice()
         device.attach(to: memory)
+        // v6: the supervisor chip watches this CPU<->GPU pair. The
+        // run-slice size below comes from the chip (SET_CPU_SLICE),
+        // and every slice's wall time is reported back to it.
+        let governor = NovaGovernorDevice()
+        governor.attach(to: memory)
+        governor.supervise(device)
+        device.governor = governor
+        governor.chip.setEnabled(true)
         var consoleText = ""
         memory.consoleOutput = { s in consoleText += s }
         memory.netHandler = { _, _, _, _ in -1 }
@@ -95,13 +103,27 @@ enum ProofRunner {
         memory.timerCount = 0
         // Run in slices, servicing the GPU between slices (the device
         // does its DMA at service points, never inside an MMIO write —
-        // see NovaBus.swift).
+        // see NovaBus.swift). v6: the slice size is the governor's
+        // SET_CPU_SLICE actuator — each slice is timed and reported
+        // to the chip, which steers the size toward its 2 ms target.
         var budget: UInt64 = 0
+        var slices = 0
+        let runT0 = Date()
         repeat {
-            cpu.run(maxSteps: 100_000)
-            budget += 100_000
+            let slice = governor.chip.cpuSliceSteps
+            let s0 = Date()
+            cpu.run(maxSteps: Int(slice))
+            let sliceMs = Date().timeIntervalSince(s0) * 1000
+            budget += slice
+            slices += 1
             device.servicePendingWork()
+            governor.chip.tickCPU(sliceMs: sliceMs, steps: slice)
         } while cpu.running && budget < 200_000_000
+        let runWall = Date().timeIntervalSince(runT0)
+        out.append("CPU run: \(String(format: "%.2f", runWall)) s wall, \(slices) governor-supervised slices, final slice \(governor.chip.cpuSliceSteps) steps")
+        for a in governor.chip.actionLog {
+            out.append("  governor: \(a.text)")
+        }
 
         out.append("guest console:")
         for l in consoleText.split(separator: "\n") { out.append("  | \(l)") }
