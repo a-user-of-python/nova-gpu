@@ -113,3 +113,38 @@ is large. Threshold sweep (this run): 65,536-vector minimum at
 threshold **2048** exactly (419.5 ms vs 566.9 @1024, 437.8
 @4096); 8,192 within noise of its 1024 minimum. **Threshold
 stays 2048**, now sweep-backed rather than inherited.
+
+## Attempts 3 + 4 — C writeback, clip fast path (CI runs 43485771309, 43487263758)
+
+Attempt 3 (C fragment writeback, `ngp_flush_writeback`): all
+checksums byte-identical. Gains small and scale-dependent
+(nofrag fragExecCpu 5.18 → 4.88 ms; plot pass 2 flat at 65k,
+better at 32k/1k) — the flush floor is mostly the surrounding
+warp machinery, not the conversion loop. Kept: byte-exact, no
+regression. In that run the armed scene matched the unarmed
+one (15.22 vs 15.24 ms) and the test pass read 37.6M tri/s.
+
+Attempt 4 (clip fast path): clip stage **2.30 → 0.81 ms**
+(app-scene-lit), with the same ~2.5× reduction in the other
+three scene variants (0.82–0.92 ms) — the removed cost was
+struct-copy traffic, not math. App-scene frame 13.2 ms on
+that run's (healthy) runner; armed test scene 13.80 ms with
+the pass at 34.1M tri/s. CU sweep flat again (12.4–12.6 ms at
+768 / 1536 / 3072 CUs) — 1536 confirmed a third time.
+Runner-health warning: absolute plot totals swung 314–626 ms
+for identical code across these runs; only stage ratios and
+the tight micro loops are comparable, and those are what the
+claims above rest on.
+
+## v5 summary (all HOST numbers — the device verdict is Sean's)
+
+- In-scene VPU test: bit-exact on every host check (0
+  mismatches, max error 0.0, armed frames byte-identical to
+  unarmed), fault-injection proven to fail loudly, pass
+  throughput 34–38M triangles/s ≈ 1 ms/frame at the app
+  scene's 29,696 triangles.
+- Wide VPU issue: 2.67× the per-triangle micro (140M vs 53M
+  tri/s serial, same-run A/B).
+- Clip stage ≈2.5× faster; C writeback byte-exact with small
+  gains; plot threshold 2048 re-swept and kept; 1536 CUs
+  confirmed; every pre-v5 framebuffer checksum unchanged.
