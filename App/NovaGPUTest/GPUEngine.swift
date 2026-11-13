@@ -217,7 +217,7 @@ struct LiveSceneView: View {
                     .overlay(Text("warming up…").foregroundColor(.white))
             }
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 4) {
-                GridRow { Text("Compute units active"); Text("\(engine.cusActive) / 1536").bold() }
+                GridRow { Text("Compute units active"); Text("\(engine.cusActive) / \(NovaGPU.computeUnits)").bold() }
                 GridRow { Text("Triangles per frame"); Text("\(engine.triangles)").bold() }
                 GridRow { Text("Frame time"); Text(String(format: "%.1f ms", engine.frameMs)).bold() }
                 GridRow { Text("FPS"); Text(String(format: "%.1f", engine.fps)).bold() }

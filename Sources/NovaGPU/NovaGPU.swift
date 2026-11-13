@@ -67,6 +67,21 @@ enum GPUError: Error, CustomStringConvertible {
     }
 }
 
+/// Per-draw stage timings (v4 profiling). Wall time of each pipeline
+/// section of the most recent draw, in milliseconds. The sections run
+/// their internal parallelism to completion before the next begins,
+/// so the section walls sum to (approximately) the draw's wall time
+/// and show exactly where a frame goes. Filled by draw() always —
+/// the cost is a handful of clock reads per draw.
+struct DrawProfile {
+    var snapshotMs: Double = 0   // VRAM -> host snapshot of vertex/index data
+    var vertexMs: Double = 0     // vertex stage (warps over clusters)
+    var clipMs: Double = 0       // clip + fan + screen transform (parallel ranges)
+    var binMs: Double = 0        // triangle binning into row chunks
+    var rasterMs: Double = 0     // rasterise + fragment shading + writeback
+    var totalMs: Double = 0
+}
+
 struct GPUStats {
     var laneOps: UInt64 = 0                 // total lane-instructions executed
     var warpsIssued: UInt64 = 0
@@ -183,9 +198,16 @@ private final class FragBatcher {
 }
 
 final class NovaGPU {
-    static let clusterCount = 48
+    /// Architectural cluster count (v4: configurable). Set before
+    /// creating a device; the default is the architecture's defining
+    /// 48 clusters x 32 lanes = 1536 CUs. The count sizes the stats
+    /// buckets warps are accounted to; host execution parallelism
+    /// comes from the pipeline's work decomposition (warps, clip
+    /// ranges, row chunks), so the bench — not intuition — decides
+    /// whether a different count earns its place (see BENCH-v4.md).
+    static var clusterCount = 48
     static let lanesPerCluster = 32
-    static let computeUnits = clusterCount * lanesPerCluster   // 1536
+    static var computeUnits: Int { clusterCount * lanesPerCluster }   // 1536 at default
     static let vramSize: UInt64 = 2 * 1024 * 1024 * 1024       // 2 GiB
     static let blockSize = 65536                               // sparse commit granularity
 
@@ -408,6 +430,9 @@ final class NovaGPU {
     var fbHeight: Int = 0
     var textures: [Int: (handle: UInt64, w: Int, h: Int)] = [:]
     private(set) var stats = GPUStats()
+    /// Stage timings of the most recent draw (v4 profiling).
+    private(set) var lastDrawProfile = DrawProfile()
+    static func nowMs() -> Double { ProcessInfo.processInfo.systemUptime * 1000 }
 
     func setUniform(index: Int, _ v: (Float, Float, Float, Float)) {
         guard index >= 0 && index < 16 else { return }
@@ -649,6 +674,8 @@ final class NovaGPU {
         let unis = uniforms
         let width = fbWidth, height = fbHeight
 
+        var prof = DrawProfile()
+        let pT0 = Self.nowMs()
         // ---- Buffer snapshots: one locked read each (v1 fetched the
         // vertex buffer one float and the index buffer one word at a
         // time through the lock).
@@ -675,6 +702,8 @@ final class NovaGPU {
         let perWarpOps = UnsafeMutablePointer<UInt64>.allocate(capacity: max(warpCount, 1))
         perWarpOps.initialize(repeating: 0, count: max(warpCount, 1))
         defer { perWarpOps.deinitialize(count: max(warpCount, 1)); perWarpOps.deallocate() }
+        prof.snapshotMs = Self.nowMs() - pT0
+        let pV0 = Self.nowMs()
         let vbF = vbFloats
         DispatchQueue.concurrentPerform(iterations: warpCount) { warp in
             let base = warp * 32
@@ -713,6 +742,7 @@ final class NovaGPU {
             stats.lanesPerCluster[warp % Self.clusterCount] += v
             stats.laneOps += v
         }
+        prof.vertexMs = Self.nowMs() - pV0
         stats.trianglesIn += UInt64(idxCount / 3)
 
         // ---- Clip + fan-triangulate once, into a work list with
@@ -733,6 +763,7 @@ final class NovaGPU {
         // range order, so the merged list is element-for-element the
         // serial list: triangle order, and therefore depth-tie
         // behaviour, is unchanged.
+        let pC0 = Self.nowMs()
         let triCount = idxCount >= 3 ? (idxCount - 3) / 3 + 1 : 0
         final class WorkBox { var tris: [WorkTri] = [] }
         let rangeCount = min(32, max(triCount, 1))
@@ -765,6 +796,8 @@ final class NovaGPU {
             workStarts.append(work.count)
         }
         stats.trianglesOut += UInt64(work.count)
+        prof.clipMs = Self.nowMs() - pC0
+        let pB0 = Self.nowMs()
 
         // ---- Rasterise in horizontal row chunks over the clusters.
         // Chunks own disjoint framebuffer rows, so the shared depth
@@ -807,6 +840,8 @@ final class NovaGPU {
         for box in binBoxes {
             for c in 0..<chunkCount { bins[c].append(contentsOf: box.bins[c]) }
         }
+        prof.binMs = Self.nowMs() - pB0
+        let pR0 = Self.nowMs()
         let chunkOps = UnsafeMutablePointer<UInt64>.allocate(capacity: chunkCount)
         let chunkFrags = UnsafeMutablePointer<UInt64>.allocate(capacity: chunkCount)
         let chunkWarps = UnsafeMutablePointer<UInt64>.allocate(capacity: chunkCount)
@@ -855,10 +890,13 @@ final class NovaGPU {
             stats.fragmentsShaded += chunkFrags[c]
             fragWarps += chunkWarps[c]
         }
+        prof.rasterMs = Self.nowMs() - pR0
         stats.warpsIssued += UInt64(warpCount) + fragWarps
         stats.draws += 1
         let ms = Date().timeIntervalSince(t0) * 1000
         stats.lastFrameMs = ms
+        prof.totalMs = ms
+        lastDrawProfile = prof
         return ms
     }
 

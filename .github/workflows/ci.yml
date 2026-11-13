@@ -60,6 +60,37 @@ jobs:
           name: test-logs
           path: build/*.log
 
+  bench:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the C hot core
+        run: |
+          mkdir -p build
+          clang -O3 -ffp-contract=off -fno-fast-math -c \
+            Sources/NovaGPU/NovaGPUFast.c -o build/NovaGPUFast.o
+      - name: Build bench harness (v4 profiling)
+        run: |
+          swiftc -O -o build/bench \
+            BenchTests/main.swift \
+            App/NovaGPUTest/NovaMemory.swift \
+            Sources/NovaGPU/NovaGPUShader.swift \
+            Sources/NovaGPU/NovaGPU.swift \
+            Sources/NovaGPU/NovaBus.swift \
+            Sources/NovaGPU/NovaBusClient.swift \
+            Sources/NovaGPU/NovaGPUStandard.swift \
+            build/NovaGPUFast.o
+      - name: Run benchmarks
+        run: |
+          set -o pipefail
+          ./build/bench | tee build/bench.log
+      - name: Upload bench log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-log
+          path: build/bench.log
+
   build-ipa:
     runs-on: macos-26
     needs: host-tests
