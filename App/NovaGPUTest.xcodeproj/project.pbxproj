@@ -19,6 +19,7 @@
 		8EB8772023239DAF9F5868AA /* NovaBus.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0E2EB074B8BAF0F7F6F15B74 /* NovaBus.swift */; };
 		42A218C2CBB8708102E6EFB5 /* NovaBusClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 98E4547EC62C53D2FB2FDED2 /* NovaBusClient.swift */; };
 		F8E1F68BA144C553064E0EF1 /* NovaGPUStandard.swift in Sources */ = {isa = PBXBuildFile; fileRef = F80778D59B7D34A47EC5E870 /* NovaGPUStandard.swift */; };
+		05BE2028F13CEE2FDA7F112A /* NovaGovernor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 74BF62DE48168226D7CC4A81 /* NovaGovernor.swift */; };
 		BB992455EFCB5962AAEE853A /* gpu_driver.bin in Resources */ = {isa = PBXBuildFile; fileRef = 4B165D994FE4854F57458812 /* gpu_driver.bin */; };
 /* End PBXBuildFile section */
 /* Begin PBXFileReference section */
@@ -36,6 +37,7 @@
 		0E2EB074B8BAF0F7F6F15B74 /* NovaBus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../Sources/NovaGPU/NovaBus.swift; sourceTree = "SOURCE_ROOT"; };
 		98E4547EC62C53D2FB2FDED2 /* NovaBusClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../Sources/NovaGPU/NovaBusClient.swift; sourceTree = "SOURCE_ROOT"; };
 		F80778D59B7D34A47EC5E870 /* NovaGPUStandard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../Sources/NovaGPU/NovaGPUStandard.swift; sourceTree = "SOURCE_ROOT"; };
+		74BF62DE48168226D7CC4A81 /* NovaGovernor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../Sources/NovaGPU/NovaGovernor.swift; sourceTree = "SOURCE_ROOT"; };
 		4B165D994FE4854F57458812 /* gpu_driver.bin */ = {isa = PBXFileReference; lastKnownFileType = file; path = NovaGPUTest/gpu_driver.bin; sourceTree = SOURCE_ROOT; };
 		A24EC9576C74F7F59EF189F6 /* NovaGPUTest.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = NovaGPUTest.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -45,7 +47,7 @@
 /* Begin PBXGroup section */
 		F49BA19B0173A46AF9495225 = {isa = PBXGroup; children = (2E767A84DC7286285A16BF1E /* NovaGPUTest */, A66639400F527FA485E88FEF /* NovaGPU */, DDFC7568DC69E4E8436EDEBF /* Products */); sourceTree = "<group>"; };
 		2E767A84DC7286285A16BF1E /* NovaGPUTest */ = {isa = PBXGroup; children = (BC8B16EFAD1F448AB57BDC6C /* NovaGPUTestApp.swift */, AFD8148429DB19731649D282 /* GPUEngine.swift */, A6CCDE4C48B6654B3F9DB212 /* SelfTests.swift */, ECB9A880AD070483704B3BB3 /* ProofRunner.swift */, 2250B73607B2FDFAE10678B7 /* NovaCPU.swift */, 6B04AD2433DB56F611C7E512 /* NovaMemory.swift */, AA9BD0AB341A019F83B3F869 /* NovaJIT.swift */, 4B165D994FE4854F57458812 /* gpu_driver.bin */); path = NovaGPUTest; sourceTree = "<group>"; };
-		A66639400F527FA485E88FEF /* NovaGPU */ = {isa = PBXGroup; children = (4A2DBE5E96332076C454354C /* NovaGPUShader.swift */, E5676F78BF8832FABD6B99F1 /* NovaGPUFast.c */, 0A4D1590D00B9658D5B8515A /* NovaGPU.swift */, C0EBC2B6AADA103C02729918 /* NovaGPUVector.swift */, 0E2EB074B8BAF0F7F6F15B74 /* NovaBus.swift */, 98E4547EC62C53D2FB2FDED2 /* NovaBusClient.swift */, F80778D59B7D34A47EC5E870 /* NovaGPUStandard.swift */); name = NovaGPU; sourceTree = "<group>"; };
+		A66639400F527FA485E88FEF /* NovaGPU */ = {isa = PBXGroup; children = (4A2DBE5E96332076C454354C /* NovaGPUShader.swift */, E5676F78BF8832FABD6B99F1 /* NovaGPUFast.c */, 0A4D1590D00B9658D5B8515A /* NovaGPU.swift */, C0EBC2B6AADA103C02729918 /* NovaGPUVector.swift */, 0E2EB074B8BAF0F7F6F15B74 /* NovaBus.swift */, 98E4547EC62C53D2FB2FDED2 /* NovaBusClient.swift */, F80778D59B7D34A47EC5E870 /* NovaGPUStandard.swift */, 74BF62DE48168226D7CC4A81 /* NovaGovernor.swift */); name = NovaGPU; sourceTree = "<group>"; };
 		DDFC7568DC69E4E8436EDEBF /* Products */ = {isa = PBXGroup; children = (A24EC9576C74F7F59EF189F6 /* NovaGPUTest.app */); name = Products; sourceTree = "<group>"; };
 /* End PBXGroup section */
 /* Begin PBXNativeTarget section */
@@ -81,7 +83,7 @@
 		1F7108461CE91E8F37DF6E5B /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (BB992455EFCB5962AAEE853A /* gpu_driver.bin in Resources */); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXResourcesBuildPhase section */
 /* Begin PBXSourcesBuildPhase section */
-		AA391AD79F2621031DF45E21 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (CC6A904868A44F4BAB69E161 /* NovaGPUTestApp.swift in Sources */, 64E30651A23ADE3993A907A4 /* GPUEngine.swift in Sources */, 858FF3A5EE70A3172691D627 /* SelfTests.swift in Sources */, 7C6C03058D9FBA80543C0241 /* ProofRunner.swift in Sources */, 75F1712EC0D3A30DF91E2AC3 /* NovaCPU.swift in Sources */, 52D2C9FA3AAF941A4316299A /* NovaMemory.swift in Sources */, B6437A4190C67DAD69234E91 /* NovaJIT.swift in Sources */, 8489B616ABC984961A8E6640 /* NovaGPUShader.swift in Sources */, BFA5E1F54272AE6FF9930679 /* NovaGPUFast.c in Sources */, 7EFCC660A4F1A96D39917DB4 /* NovaGPU.swift in Sources */, 46A1547A3C0F1F426CC6636E /* NovaGPUVector.swift in Sources */, 8EB8772023239DAF9F5868AA /* NovaBus.swift in Sources */, 42A218C2CBB8708102E6EFB5 /* NovaBusClient.swift in Sources */, F8E1F68BA144C553064E0EF1 /* NovaGPUStandard.swift in Sources */); runOnlyForDeploymentPostprocessing = 0; };
+		AA391AD79F2621031DF45E21 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (CC6A904868A44F4BAB69E161 /* NovaGPUTestApp.swift in Sources */, 64E30651A23ADE3993A907A4 /* GPUEngine.swift in Sources */, 858FF3A5EE70A3172691D627 /* SelfTests.swift in Sources */, 7C6C03058D9FBA80543C0241 /* ProofRunner.swift in Sources */, 75F1712EC0D3A30DF91E2AC3 /* NovaCPU.swift in Sources */, 52D2C9FA3AAF941A4316299A /* NovaMemory.swift in Sources */, B6437A4190C67DAD69234E91 /* NovaJIT.swift in Sources */, 8489B616ABC984961A8E6640 /* NovaGPUShader.swift in Sources */, BFA5E1F54272AE6FF9930679 /* NovaGPUFast.c in Sources */, 7EFCC660A4F1A96D39917DB4 /* NovaGPU.swift in Sources */, 46A1547A3C0F1F426CC6636E /* NovaGPUVector.swift in Sources */, 8EB8772023239DAF9F5868AA /* NovaBus.swift in Sources */, 42A218C2CBB8708102E6EFB5 /* NovaBusClient.swift in Sources */, F8E1F68BA144C553064E0EF1 /* NovaGPUStandard.swift in Sources */, 05BE2028F13CEE2FDA7F112A /* NovaGovernor.swift in Sources */); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 /* Begin XCBuildConfiguration section */
 		D6D6C4244CCC314E9F375A42 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SWIFT_VERSION = 5.0; DEBUG_INFORMATION_FORMAT = dwarf; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; }; name = Debug; };
