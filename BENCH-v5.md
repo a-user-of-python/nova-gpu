@@ -93,3 +93,23 @@ accounting totals 16.50 ms over 8 frames (≈2.1 ms/frame,
 14.4M triangles/s through grab + calculator + compare), a cost
 inside this run's scene-to-scene noise. VPU micro same run:
 51.4M tri/s serial, 99.3M tri/s MGVPU-parallel.
+
+## Attempt 2 — wide VPU issue (CI run 43484455833, tests + bench green)
+
+Same-run micro A/B (the clean comparison): per-triangle VPU
+issue 52.6M tri/s serial; **wide issue 140.4M tri/s serial —
+2.67×** for identical grab + position work (parallel wide
+135.6M ≈ serial at this 0.2 ms scale — dispatch-bound). The
+in-scene test pass: **27.5M tri/s** (attempt 1: 14.4M),
+≈1.08 ms/frame at 29,696 triangles. Host tests prove the wide
+path bit-exact (section 12) and plot output batch-size
+invariant (section 9f: batch 1 / 7 / 1024 → identical frames).
+
+Plot: 65,536 vectors total 625.8 ms (pass 1 379.5 / pass 2
+243.7) vs attempt-1 run's 666.1 (386.9 / 225.4) — inside
+cross-run noise; pass 1 is Swift bookkeeping-bound, so the
+wide issue's plot effect is small even though its VPU effect
+is large. Threshold sweep (this run): 65,536-vector minimum at
+threshold **2048** exactly (419.5 ms vs 566.9 @1024, 437.8
+@4096); 8,192 within noise of its 1024 minimum. **Threshold
+stays 2048**, now sweep-backed rather than inherited.
