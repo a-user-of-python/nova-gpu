@@ -84,3 +84,9 @@ the judge).
   GPUStats.vectorsPlotted added.
 - Expected: all checksums identical; vertex stage and raster CPU
   down. Status: pushed, awaiting CI.
+- CI run 43475037169: FAILURE — 'cannot find GrabUnit in scope'.
+  Root cause: the new NovaGPUVector.swift was not in the build
+  lists — ci.yml enumerates sources explicitly (3 swiftc builds)
+  and so does the Xcode project. Fixed both (ci.yml x3, pbxproj
+  build file + file ref + group + sources phase). Lesson logged:
+  new source files must be registered in FOUR places.

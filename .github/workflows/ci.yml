@@ -28,6 +28,7 @@ jobs:
             App/NovaGPUTest/NovaMemory.swift \
             Sources/NovaGPU/NovaGPUShader.swift \
             Sources/NovaGPU/NovaGPU.swift \
+            Sources/NovaGPU/NovaGPUVector.swift \
             Sources/NovaGPU/NovaBus.swift \
             Sources/NovaGPU/NovaBusClient.swift \
             Sources/NovaGPU/NovaGPUStandard.swift \
@@ -45,6 +46,7 @@ jobs:
             App/NovaGPUTest/NovaJIT.swift \
             Sources/NovaGPU/NovaGPUShader.swift \
             Sources/NovaGPU/NovaGPU.swift \
+            Sources/NovaGPU/NovaGPUVector.swift \
             Sources/NovaGPU/NovaBus.swift \
             Sources/NovaGPU/NovaBusClient.swift \
             Sources/NovaGPU/NovaGPUStandard.swift \
@@ -76,6 +78,7 @@ jobs:
             App/NovaGPUTest/NovaMemory.swift \
             Sources/NovaGPU/NovaGPUShader.swift \
             Sources/NovaGPU/NovaGPU.swift \
+            Sources/NovaGPU/NovaGPUVector.swift \
             Sources/NovaGPU/NovaBus.swift \
             Sources/NovaGPU/NovaBusClient.swift \
             Sources/NovaGPU/NovaGPUStandard.swift \
