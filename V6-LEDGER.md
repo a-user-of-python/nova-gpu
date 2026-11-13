@@ -42,7 +42,7 @@ A first-class device, not app glue:
      host, which is what moves the stage tail (and therefore
      jitter) without touching a single pixel.
 - **Special commands**: every change the chip makes is a named
-  command (SET_GPU_WIDTH, SET_RASTER_GRAIN, SET_CLIP_RANGES,
+  command (SET_GPU_WIDTH, SET_RASTER_GRAIN,
   SET_CPU_SLICE, SET_PACE_TIER, SET_SCRATCH_RETENTION) issued
   through one path, applied to the real knobs, and written to an
   action log with the numbers that caused it ("frame jitter
@@ -86,7 +86,18 @@ verdict is Sean's.
   grain / width / clip-range sweeps on the app scene.
 - Expected: all host tests + proof unchanged; bench gives the v6
   baseline (frame series + stage medians) in BENCH-v6.md.
-- Status: in progress.
+- Measured (CI run 43507604592, all jobs green; full numbers in
+  BENCH-v6.md): engine-series jitter baseline — 85 frames, mean
+  24.0 ms, stdev 3.93 ms, p95 32.6, min 16.5, max 36.7 (jitter
+  37% of median — the governor's 30% trigger sits on it). Grain
+  sweep: finer grain costs host mean (rows 1 = 40.6 ms vs 4 =
+  23.7) → policy grain floor is 2, default stays 4. Width sweep:
+  caps cost mean on an unloaded runner → width is a contention
+  lever only, applied last. Clip ranges 8 vs 32: no signal →
+  default 32 stands and the governor does not manage that knob
+  (SET_CLIP_RANGES was dropped from the command set for exactly
+  this reason — a command with no measurable effect is theatre).
+- Status: DONE.
 
 ## Attempt 1 — the governor chip
 - Sources/NovaGPU/NovaGovernor.swift: telemetry window, policy
@@ -103,6 +114,7 @@ verdict is Sean's.
   toward its target band), pixel invariance across knob settings.
 - CI workflow + Xcode project gain the new source file.
 - Expected: all pre-v6 checksums unchanged; section 13 green.
+- Status: implemented; CI pending.
 
 ## Attempt 2 — app integration
 - GPUEngine (Live Scene): governor created + attached + supervising
