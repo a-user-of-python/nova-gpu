@@ -115,6 +115,7 @@ func reportScene(_ name: String, _ r: (frame: Double, prof: DrawProfile, frags: 
 }
 
 let vsLit = NovaGPUStandard.vertexLitProgram()
+let vsLitV4 = NovaGPUStandard.vertexLitProgramV4()
 let fsLit = NovaGPUStandard.fragmentLitProgram()
 
 do {
@@ -122,6 +123,11 @@ do {
     // 1. The app scene, as shipped.
     let app = try appScene(frames: 8, vProg: vsLit, fProg: fsLit)
     reportScene("app-scene-lit", app)
+
+    // 1a. Same scene, v4 vertex program (VMAT4): same-run A/B for
+    //     the vertex stage against the v1 program above.
+    let appV4 = try appScene(frames: 8, vProg: vsLitV4, fProg: fsLit)
+    reportScene("app-scene-lit-v4vert", appV4)
 
     // 1b. Executor floor: fragment program is a bare END (default
     //     colour out) — raster wall then holds coverage +

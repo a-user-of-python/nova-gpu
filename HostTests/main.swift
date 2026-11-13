@@ -527,15 +527,25 @@ do {
     var actual = Set<Int>()
     for y in 0..<fbH { for x in 0..<fbW where wordAt(x, y) == colourWord { actual.insert(y * fbW + x) } }
     func expectedLine(_ gx0: Int, _ gy0: Int, _ gx1: Int, _ gy1: Int) -> Set<Int> {
+        // The plot unit's DDA spec, in Double: pixel-resolution
+        // steps over the grid, same rounding, same gap insurance.
         var set = Set<Int>()
-        let steps = max(abs(gx1 - gx0), abs(gy1 - gy0))
-        if steps == 0 { set.insert((gy0 >> 6) * fbW + (gx0 >> 6)); return set }
+        let dx = gx1 - gx0, dy = gy1 - gy0
+        let gridSteps = max(abs(dx), abs(dy))
+        if gridSteps == 0 { set.insert((gy0 >> 6) * fbW + (gx0 >> 6)); return set }
+        let steps = (gridSteps + 63) / 64
+        var lastPx = Int.min, lastPy = Int.min
         for s in 0...steps {
             let t = Double(s) / Double(steps)
-            let gx = Double(gx0) + Double(gx1 - gx0) * t
-            let gy = Double(gy0) + Double(gy1 - gy0) * t
+            let gx = Double(gx0) + Double(dx) * t
+            let gy = Double(gy0) + Double(dy) * t
             let ex = Int(gx + 0.5) >> 6, ey = Int(gy + 0.5) >> 6
+            if lastPx != Int.min && (abs(ex - lastPx) > 1 || abs(ey - lastPy) > 1) {
+                let mx = (lastPx + ex) / 2, my = (lastPy + ey) / 2
+                if mx >= 0 && mx < fbW && my >= 0 && my < fbH { set.insert(my * fbW + mx) }
+            }
             if ex >= 0 && ex < fbW && ey >= 0 && ey < fbH { set.insert(ey * fbW + ex) }
+            lastPx = ex; lastPy = ey
         }
         return set
     }

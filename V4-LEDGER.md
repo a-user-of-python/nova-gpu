@@ -140,3 +140,19 @@ the judge).
 - Same-pixel DDA samples coalesced to max z (provably identical
   framebuffer + final depth; removes ~64x redundant shading on
   long vectors).
+
+## Attempt 4 — plot DDA sampling fix (bench-driven)
+- CI run 43477094175 (HEAD incl. attempts 2+3 + sizing + MGVPU):
+  SUCCESS, all tests green (sections 8/9/10 exact). BUT the plot
+  saturation bench exposed the grid-step DDA: 1024 vectors =
+  203 ms, 65,536 = 3.56 s — sampling every 1/64-px grid step
+  visits ~64x more points than pixels.
+- Fix: DDA steps at pixel resolution over the grid (steps =
+  ceil(grid Chebyshev / 64)); sample positions still computed in
+  grid space so endpoints are grid-exact; gap-insurance midpoint
+  emit keeps the chain 8-connected; test reference updated to
+  the same spec in Double. Bench also gains a same-run A/B:
+  app-scene-lit-v4vert (VMAT4 vertex program).
+- Executor micros in that CI run read 1.43/3.20 us/warp vs
+  0.72/2.09 in the healthier step-A run — shared-runner noise;
+  only same-run comparisons are cited anywhere.

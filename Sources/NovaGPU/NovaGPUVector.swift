@@ -211,28 +211,51 @@ struct VPU {
 /// Double-precision implementation of the same DDA spec, which
 /// the host tests carry as the reference.
 enum PlotUnit {
-    /// Rasterise one vector (two grid endpoints) one sample at a
-    /// time, DDA-sampled at grid resolution: steps = the Chebyshev
-    /// distance in grid units, one sample per step, coordinates
-    /// rounded via Int(value + 0.5) truncation (round-half-up for
-    /// the non-negative coordinates that survive clipping; samples
-    /// outside the framebuffer are dropped by the caller, as the
-    /// triangle pipeline's binning drops them). The callback also
-    /// receives the step index and count so the caller can
-    /// interpolate depth along the vector.
+    /// Rasterise one vector (two grid endpoints) with a DDA that
+    /// steps at PIXEL resolution over the grid: steps = the
+    /// Chebyshev distance between the endpoints measured in whole
+    /// pixels (grid distance / 64, rounded up), sample positions
+    /// interpolated in grid space (Float) and rounded via
+    /// Int(value + 0.5) truncation, so endpoints land exactly on
+    /// their grid coordinates and the chain advances at most one
+    /// pixel per step on the major axis. (Sampling every grid step
+    /// instead would visit ~64× more points than there are pixels
+    /// — the grid is the coordinate precision, not the sampling
+    /// rate.) If a rounding boundary ever makes a sample jump two
+    /// pixels, the midpoint pixel is emitted too, so the drawn
+    /// chain is 8-connected by construction. Samples outside the
+    /// framebuffer are dropped by the caller, as the triangle
+    /// pipeline's binning drops them. The callback also receives
+    /// the step index and count so the caller can interpolate
+    /// depth along the vector (midpoint inserts report the same
+    /// step as the sample that triggered them).
     static func rasterizeLine(x0: Int, y0: Int, x1: Int, y1: Int,
                               emit: (Int, Int, Int, Int) -> Void) {
-        let steps = max(abs(x1 - x0), abs(y1 - y0))
-        if steps == 0 {
+        let sub = 1 << ScreenSpace.fracBits   // grid units per pixel (64)
+        let dx = x1 - x0, dy = y1 - y0
+        let gridSteps = max(abs(dx), abs(dy))
+        if gridSteps == 0 {
             emit(x0, y0, 0, 0)
             return
         }
+        let steps = (gridSteps + sub - 1) / sub
         let fs = Float(steps)
+        var lastPx = Int.min, lastPy = Int.min
         for s in 0...steps {
             let t = Float(s) / fs
-            let gx = Float(x0) + Float(x1 - x0) * t
-            let gy = Float(y0) + Float(y1 - y0) * t
-            emit(Int(gx + 0.5), Int(gy + 0.5), s, steps)
+            let gx = Float(x0) + Float(dx) * t
+            let gy = Float(y0) + Float(dy) * t
+            let ex = Int(gx + 0.5), ey = Int(gy + 0.5)
+            let px = ex >> ScreenSpace.fracBits, py = ey >> ScreenSpace.fracBits
+            if lastPx != Int.min
+                && (abs(px - lastPx) > 1 || abs(py - lastPy) > 1) {
+                // Gap insurance: fill the midpoint pixel so the
+                // chain stays 8-connected.
+                emit(((lastPx + px) / 2) << ScreenSpace.fracBits,
+                     ((lastPy + py) / 2) << ScreenSpace.fracBits, s, steps)
+            }
+            emit(ex, ey, s, steps)
+            lastPx = px; lastPy = py
         }
     }
 }

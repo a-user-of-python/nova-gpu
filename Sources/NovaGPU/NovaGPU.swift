@@ -1066,13 +1066,13 @@ final class NovaGPU {
         // Pass 1 worker: positions vectors [lo, hi) (grab + VPU),
         // projects them to the screen grid, DDA-rasterises, and
         // hands each sample to `emit` as (pixelIndex, z). Consecu-
-        // tive samples landing on the same pixel are coalesced to
-        // their max z first: the DDA steps at 1/64-pixel resolution,
-        // so one pixel can receive ~64 samples per vector, and the
-        // serial walk's outcome for the run is exactly "the max-z
-        // sample tests once" (z is monotonic along a vector) — the
-        // framebuffer and final depth are bit-identical, only
-        // redundant fragment shading is removed.
+        // tive samples landing on the same pixel (rounding can
+        // repeat a pixel on shallow slopes) are coalesced to their
+        // max z first: the serial walk's outcome for such a run is
+        // exactly "the max-z sample tests once" (z is monotonic
+        // along a vector) — the framebuffer and final depth are
+        // bit-identical, only redundant fragment shading is
+        // removed.
         func processRange(_ lo: Int, _ hi: Int, _ emit: (Int, Float) -> Void) -> UInt64 {
             var count: UInt64 = 0
             var vpu = VPU()
