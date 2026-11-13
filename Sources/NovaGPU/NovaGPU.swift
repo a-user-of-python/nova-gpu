@@ -285,6 +285,12 @@ final class NovaGPU {
     /// at this many vectors (internal; host tests lower it to
     /// force the parallel path on small scenes).
     static var plotParallelThreshold = 2048
+    /// v5: plot pass 1 grabs + positions endpoints in batches of
+    /// this many vectors (wide calculator issue — one ngp_mat4
+    /// call per batch instead of one 3-lane call per vector).
+    /// Internal; host tests vary it to prove the plotted frame
+    /// does not depend on it.
+    static var plotBatchSize = 128
     static let vramSize: UInt64 = 2 * 1024 * 1024 * 1024       // 2 GiB
     static let blockSize = 65536                               // sparse commit granularity
 
@@ -1120,55 +1126,94 @@ final class NovaGPU {
         let ranges = MGVPU.subRanges(count: triCount)
         var clusters = 0
         for r in ranges where r.1 > r.0 { clusters += 1 }
+        // Position + compare, per MGVPU sub-range in parallel.
+        // Each range works in groups of up to 256 triangles: the
+        // grab unit fetches every triangle's records into the
+        // group buffer (each triangle still grabbed individually,
+        // as its own VPU workload), the shared 3-axis calculator
+        // issues the group wide (VPU.positionWide — bit-identical
+        // per lane), the fault hook perturbs the range's corner-0
+        // x values in place, and every corner is bit-compared
+        // against the pristine reference. Per-range counters are
+        // reduced serially afterwards.
+        let fault = Self.vpuTestFault
+        let rangeMism = UnsafeMutablePointer<Int>.allocate(capacity: ranges.count)
+        let rangeErr = UnsafeMutablePointer<Float>.allocate(capacity: ranges.count)
+        rangeMism.initialize(repeating: 0, count: ranges.count)
+        rangeErr.initialize(repeating: 0, count: ranges.count)
+        defer {
+            rangeMism.deinitialize(count: ranges.count); rangeMism.deallocate()
+            rangeErr.deinitialize(count: ranges.count); rangeErr.deallocate()
+        }
         unis.withUnsafeBufferPointer { ub in
             let mPtr = ub.baseAddress!
             DispatchQueue.concurrentPerform(iterations: ranges.count) { r in
                 let lo = ranges[r].0, hi = ranges[r].1
                 if lo >= hi { return }
-                var vpu = VPU()
-                withUnsafeTemporaryAllocation(of: Float.self, capacity: 12) { s in
-                    s.initialize(repeating: 0)
-                    let sPtr = s.baseAddress!
-                    for k in lo..<hi {
-                        let t = k * 3
-                        GrabUnit.grabTrianglePositions(
-                            snapshot: vbF,
-                            Int(ibWords[t]), Int(ibWords[t + 1]), Int(ibWords[t + 2]),
-                            into: sPtr)
-                        vpu.load(positions: sPtr)
-                        vpu.position(matrix: mPtr, into: out + k * 12)
+                var mism = 0
+                var mErr: Float = 0
+                let groupMax = 256
+                withUnsafeTemporaryAllocation(of: Float.self, capacity: groupMax * 12) { gbuf in
+                    gbuf.initialize(repeating: 0)
+                    let gPtr = gbuf.baseAddress!
+                    var gLo = lo
+                    while gLo < hi {
+                        let gHi = min(hi, gLo + groupMax)
+                        let gn = gHi - gLo
+                        for k in gLo..<gHi {
+                            let t = k * 3
+                            GrabUnit.grabTrianglePositions(
+                                snapshot: vbF,
+                                Int(ibWords[t]), Int(ibWords[t + 1]), Int(ibWords[t + 2]),
+                                into: gPtr + (k - gLo) * 12)
+                        }
+                        VPU.positionWide(positions: gPtr, vertices: gn * 3,
+                                         matrix: mPtr, into: out + gLo * 12)
+                        if fault != 0 {
+                            for k in gLo..<gHi { out[k * 12] += fault }   // host-test fault hook
+                        }
+                        for k in gLo..<gHi {
+                            let t = k * 3
+                            for c in 0..<3 {
+                                let vi = Int(ibWords[t + c])
+                                let o = k * 12 + c * 4
+                                let g0 = out[o], g1 = out[o + 1]
+                                let g2 = out[o + 2], g3 = out[o + 3]
+                                let r0 = refClip[vi * 4], r1 = refClip[vi * 4 + 1]
+                                let r2 = refClip[vi * 4 + 2], r3 = refClip[vi * 4 + 3]
+                                if g0.bitPattern != r0.bitPattern || g1.bitPattern != r1.bitPattern
+                                    || g2.bitPattern != r2.bitPattern || g3.bitPattern != r3.bitPattern {
+                                    mism += 1
+                                }
+                                let d0 = abs(g0 - r0), d1 = abs(g1 - r1)
+                                let d2 = abs(g2 - r2), d3 = abs(g3 - r3)
+                                if d0.isFinite && d0 > mErr { mErr = d0 }
+                                if d1.isFinite && d1 > mErr { mErr = d1 }
+                                if d2.isFinite && d2 > mErr { mErr = d2 }
+                                if d3.isFinite && d3 > mErr { mErr = d3 }
+                            }
+                        }
+                        gLo = gHi
                     }
                 }
+                rangeMism[r] = mism
+                rangeErr[r] = mErr
             }
         }
-        // Compare + gather (serial, in triangle order): the
-        // reference is the pristine snapshot of the shader stage's
-        // clip for the corner's vertex; the gather writes the VPU
-        // clip over the shaded vertex.
-        let fault = Self.vpuTestFault
         var mismatches = 0
         var maxErr: Float = 0
+        for r in 0..<ranges.count {
+            mismatches += rangeMism[r]
+            if rangeErr[r] > maxErr { maxErr = rangeErr[r] }
+        }
+        // Gather (serial, in triangle order): the shaded clips
+        // are overwritten with the VPU clips, so the frame that
+        // renders is positioned by the VPUs.
         for k in 0..<triCount {
             let t = k * 3
             for c in 0..<3 {
-                let vi = Int(ibWords[t + c])
                 let o = k * 12 + c * 4
-                var g0 = out[o]
-                let g1 = out[o + 1], g2 = out[o + 2], g3 = out[o + 3]
-                if fault != 0 && c == 0 { g0 += fault }   // host-test fault hook
-                let r0 = refClip[vi * 4], r1 = refClip[vi * 4 + 1]
-                let r2 = refClip[vi * 4 + 2], r3 = refClip[vi * 4 + 3]
-                if g0.bitPattern != r0.bitPattern || g1.bitPattern != r1.bitPattern
-                    || g2.bitPattern != r2.bitPattern || g3.bitPattern != r3.bitPattern {
-                    mismatches += 1
-                }
-                let d0 = abs(g0 - r0), d1 = abs(g1 - r1)
-                let d2 = abs(g2 - r2), d3 = abs(g3 - r3)
-                if d0.isFinite && d0 > maxErr { maxErr = d0 }
-                if d1.isFinite && d1 > maxErr { maxErr = d1 }
-                if d2.isFinite && d2 > maxErr { maxErr = d2 }
-                if d3.isFinite && d3 > maxErr { maxErr = d3 }
-                shadedPtr[vi].clip = (g0, g1, g2, g3)
+                shadedPtr[Int(ibWords[t + c])].clip = (out[o], out[o + 1], out[o + 2], out[o + 3])
             }
         }
         let dt = Self.nowMs() - t0
@@ -1257,67 +1302,115 @@ final class NovaGPU {
         // removed.
         func processRange(_ lo: Int, _ hi: Int, _ emit: (Int, Float) -> Void) -> UInt64 {
             var count: UInt64 = 0
-            var vpu = VPU()
             withUnsafeTemporaryAllocation(of: Float.self, capacity: 16) { mbuf in
                 mbuf.initialize(repeating: 0)
                 for i in 0..<16 { mbuf[i] = u(i) }
                 let mPtr = mbuf.baseAddress!
-                withUnsafeTemporaryAllocation(of: Float.self, capacity: 12) { scratch in
-                    scratch.initialize(repeating: 0)
-                    let sPtr = scratch.baseAddress!
-                    withUnsafeTemporaryAllocation(of: Float.self, capacity: 12) { clipBuf in
+                // v5 wide issue: endpoints are grabbed in batches
+                // (GrabUnit.grabPosition — the position record
+                // only) and positioned through the shared 3-axis
+                // calculator in ONE wide call per batch (2 lanes
+                // per line vector, 1 per point). v4 ran one VPU
+                // per vector at 3 lanes per call — below the
+                // calculator's NEON group width — and computed a
+                // duplicate third vertex for every line. The
+                // transform is the same ngp_mat4 with the same
+                // per-lane accumulation order, so the positioned
+                // endpoints are bit-identical; the skip rules,
+                // grid conversion, DDA and depth interpolation
+                // below are the v4 code, reading the batch's clip
+                // records instead of a per-vector buffer. (Batch
+                // size is NovaGPU.plotBatchSize; the host tests
+                // prove the frame is invariant to it.)
+                let perVector = mode == 0 ? 2 : 1
+                let batch = max(1, Self.plotBatchSize)
+                withUnsafeTemporaryAllocation(of: Float.self, capacity: batch * perVector * 4) { pbuf in
+                    pbuf.initialize(repeating: 0)
+                    let pPtr = pbuf.baseAddress!
+                    withUnsafeTemporaryAllocation(of: Float.self, capacity: batch * perVector * 4) { clipBuf in
                         clipBuf.initialize(repeating: 0)
                         let cPtr = clipBuf.baseAddress!
-                        for v in lo..<hi {
-                            let i0 = Int(ibWords[mode == 0 ? v * 2 : v])
-                            let i1 = mode == 0 ? Int(ibWords[v * 2 + 1]) : i0
-                            guard i0 < vertexCount, i1 < vertexCount else { continue }
-                            GrabUnit.grabTrianglePositions(snapshot: vbFloats, i0, i1, i0, into: sPtr)
-                            vpu.load(positions: sPtr)
-                            vpu.position(matrix: mPtr, into: cPtr)
-                            // Endpoints: skip on w <= 0 / non-
-                            // finite, as the clip stage does.
-                            let w0 = cPtr[3]
-                            guard w0 > 0, w0.isFinite else { continue }
-                            let iw0 = 1 / w0
-                            let nx0 = cPtr[0] * iw0, ny0 = cPtr[1] * iw0, nz0 = cPtr[2] * iw0
-                            guard nx0.isFinite, ny0.isFinite, nz0.isFinite else { continue }
-                            let gx0 = ScreenSpace.gridX(nx0, width: width)
-                            let gy0 = ScreenSpace.gridY(ny0, height: height)
-                            if mode == 1 {
-                                let px = ScreenSpace.pixel(gx0), py = ScreenSpace.pixel(gy0)
-                                if px >= 0 && px < width && py >= 0 && py < height {
-                                    emit(py * width + px, nz0)
-                                }
-                                count += 1
-                                continue
-                            }
-                            let w1 = cPtr[7]
-                            guard w1 > 0, w1.isFinite else { continue }
-                            let iw1 = 1 / w1
-                            let nx1 = cPtr[4] * iw1, ny1 = cPtr[5] * iw1, nz1 = cPtr[6] * iw1
-                            guard nx1.isFinite, ny1.isFinite, nz1.isFinite else { continue }
-                            let gx1 = ScreenSpace.gridX(nx1, width: width)
-                            let gy1 = ScreenSpace.gridY(ny1, height: height)
-                            count += 1
-                            var runDi = -1
-                            var runZ: Float = 0
-                            PlotUnit.rasterizeLine(x0: gx0, y0: gy0, x1: gx1, y1: gy1) { gx, gy, s, steps in
-                                let px = ScreenSpace.pixel(gx), py = ScreenSpace.pixel(gy)
-                                guard px >= 0 && px < width && py >= 0 && py < height else {
-                                    if runDi >= 0 { emit(runDi, runZ); runDi = -1 }
-                                    return
-                                }
-                                let z = steps == 0 ? nz0 : nz0 + (nz1 - nz0) * (Float(s) / Float(steps))
-                                let di = py * width + px
-                                if di == runDi {
-                                    if z > runZ { runZ = z }
+                        var v = lo
+                        while v < hi {
+                            let bHi = min(hi, v + batch)
+                            let bn = bHi - v
+                            // Grab this batch's endpoints. An
+                            // out-of-range index leaves its
+                            // record stale/zero — the per-vector
+                            // guard below skips it without
+                            // reading its clip, exactly as v4
+                            // skipped it before any positioning.
+                            for j in 0..<bn {
+                                let vv = v + j
+                                if mode == 0 {
+                                    let i0 = Int(ibWords[vv * 2])
+                                    let i1 = Int(ibWords[vv * 2 + 1])
+                                    if i0 < vertexCount {
+                                        GrabUnit.grabPosition(snapshot: vbFloats, vertex: i0, into: pPtr + j * 8)
+                                    }
+                                    if i1 < vertexCount {
+                                        GrabUnit.grabPosition(snapshot: vbFloats, vertex: i1, into: pPtr + j * 8 + 4)
+                                    }
                                 } else {
-                                    if runDi >= 0 { emit(runDi, runZ) }
-                                    runDi = di; runZ = z
+                                    let i0 = Int(ibWords[vv])
+                                    if i0 < vertexCount {
+                                        GrabUnit.grabPosition(snapshot: vbFloats, vertex: i0, into: pPtr + j * 4)
+                                    }
                                 }
                             }
-                            if runDi >= 0 { emit(runDi, runZ) }
+                            VPU.positionWide(positions: pPtr, vertices: bn * perVector,
+                                             matrix: mPtr, into: cPtr)
+                            for j in 0..<bn {
+                                let vv = v + j
+                                let i0 = Int(ibWords[mode == 0 ? vv * 2 : vv])
+                                let i1 = mode == 0 ? Int(ibWords[vv * 2 + 1]) : i0
+                                guard i0 < vertexCount, i1 < vertexCount else { continue }
+                                let e0 = cPtr + j * perVector * 4
+                                // Endpoints: skip on w <= 0 / non-
+                                // finite, as the clip stage does.
+                                let w0 = e0[3]
+                                guard w0 > 0, w0.isFinite else { continue }
+                                let iw0 = 1 / w0
+                                let nx0 = e0[0] * iw0, ny0 = e0[1] * iw0, nz0 = e0[2] * iw0
+                                guard nx0.isFinite, ny0.isFinite, nz0.isFinite else { continue }
+                                let gx0 = ScreenSpace.gridX(nx0, width: width)
+                                let gy0 = ScreenSpace.gridY(ny0, height: height)
+                                if mode == 1 {
+                                    let px = ScreenSpace.pixel(gx0), py = ScreenSpace.pixel(gy0)
+                                    if px >= 0 && px < width && py >= 0 && py < height {
+                                        emit(py * width + px, nz0)
+                                    }
+                                    count += 1
+                                    continue
+                                }
+                                let w1 = e0[7]
+                                guard w1 > 0, w1.isFinite else { continue }
+                                let iw1 = 1 / w1
+                                let nx1 = e0[4] * iw1, ny1 = e0[5] * iw1, nz1 = e0[6] * iw1
+                                guard nx1.isFinite, ny1.isFinite, nz1.isFinite else { continue }
+                                let gx1 = ScreenSpace.gridX(nx1, width: width)
+                                let gy1 = ScreenSpace.gridY(ny1, height: height)
+                                count += 1
+                                var runDi = -1
+                                var runZ: Float = 0
+                                PlotUnit.rasterizeLine(x0: gx0, y0: gy0, x1: gx1, y1: gy1) { gx, gy, s, steps in
+                                    let px = ScreenSpace.pixel(gx), py = ScreenSpace.pixel(gy)
+                                    guard px >= 0 && px < width && py >= 0 && py < height else {
+                                        if runDi >= 0 { emit(runDi, runZ); runDi = -1 }
+                                        return
+                                    }
+                                    let z = steps == 0 ? nz0 : nz0 + (nz1 - nz0) * (Float(s) / Float(steps))
+                                    let di = py * width + px
+                                    if di == runDi {
+                                        if z > runZ { runZ = z }
+                                    } else {
+                                        if runDi >= 0 { emit(runDi, runZ) }
+                                        runDi = di; runZ = z
+                                    }
+                                }
+                                if runDi >= 0 { emit(runDi, runZ) }
+                            }
+                            v = bHi
                         }
                     }
                 }
