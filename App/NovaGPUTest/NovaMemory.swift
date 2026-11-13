@@ -351,6 +351,11 @@ final class NovaMemory {
     // mmioRead/mmioWrite generically. 16 registers x 8 bytes.
     static let gpuBaseAddr: UInt64 = 0xFFFF_FFFF_FFFF_0100
     static let gpuEndAddr: UInt64  = 0xFFFF_FFFF_FFFF_0180
+    // NovaGovernor (v6 supervisor chip) block: a host-attached
+    // device behind MMIO registers in the same page, 16 registers
+    // x 8 bytes, exactly the GPU block's pattern.
+    static let govBaseAddr: UInt64 = 0xFFFF_FFFF_FFFF_0180
+    static let govEndAddr: UInt64  = 0xFFFF_FFFF_FFFF_0200
 
     var consoleOutput: ((String) -> Void)?
 
@@ -389,6 +394,7 @@ final class NovaMemory {
     /// Host-attached NovaGPU device: the "hardware" behind the NovaBus
     /// MMIO block (see NovaBus.swift). Set by the app / test harness.
     var gpuDevice: NovaGPUDevice?
+    var govDevice: NovaGovernorDevice?
 
     /// Buffer for assembling multi-byte UTF-8 sequences from MMIO writes.
     private var utf8Buffer = [UInt8]()
@@ -439,6 +445,8 @@ final class NovaMemory {
             netBufSize = v
         } else if addr >= Self.gpuBaseAddr && addr < Self.gpuEndAddr {
             gpuDevice?.mmioWrite(offset: addr - Self.gpuBaseAddr, value: v)
+        } else if addr >= Self.govBaseAddr && addr < Self.govEndAddr {
+            govDevice?.mmioWrite(offset: addr - Self.govBaseAddr, value: v)
         }
     }
 
@@ -459,6 +467,8 @@ final class NovaMemory {
             return UInt64(bitPattern: netResult)
         } else if addr >= Self.gpuBaseAddr && addr < Self.gpuEndAddr {
             return gpuDevice?.mmioRead(offset: addr - Self.gpuBaseAddr) ?? 0
+        } else if addr >= Self.govBaseAddr && addr < Self.govEndAddr {
+            return govDevice?.mmioRead(offset: addr - Self.govBaseAddr) ?? 0
         }
         return 0
     }
