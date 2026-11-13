@@ -90,6 +90,15 @@ enum GrabUnit {
             d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = 1
         }
     }
+
+    /// Grab ONE vertex's position record (the plot unit's endpoint
+    /// fetch, v5): [vec4] with w = 1 — identical to the position
+    /// slot of a full grab.
+    static func grabPosition(snapshot src: UnsafePointer<Float>, vertex: Int,
+                             into dst: UnsafeMutablePointer<Float>) {
+        let s = src + vertex * 12
+        dst[0] = s[0]; dst[1] = s[1]; dst[2] = s[2]; dst[3] = 1
+    }
 }
 
 /// Screen-space coordinate format for the plot unit: each axis is
@@ -191,6 +200,27 @@ struct VPU {
         withUnsafePointer(to: axes) { ap in
             ngp_mat4_f32(out, UnsafeRawPointer(ap).assumingMemoryBound(to: Float.self), m, 3)
         }
+    }
+
+    /// Wide issue (v5): position `vertices` grabbed position
+    /// records ([vertex][vec4] — the exact records load()
+    /// consumes, three per triangle workload) through the shared
+    /// 3-axis calculator in ONE ngp_mat4 call. ngp_mat4's lanes
+    /// are independent and each lane's accumulation order is the
+    /// fixed DOT4 order, so a lane's result cannot depend on how
+    /// many lanes are issued alongside it: the output is
+    /// bit-identical to running one VPU per workload (host-proven
+    /// for group sizes from 1 to 250 triangles). This is how the
+    /// VPU array is driven at scale — VPUs are issued in groups,
+    /// the way SIMD hardware issues them — and it is what the
+    /// v4 per-vector plot path could not do: it issued the
+    /// calculator at 3 lanes per call, below the NEON group
+    /// width of 4, so every call took the scalar tail path.
+    static func positionWide(positions src: UnsafePointer<Float>, vertices: Int,
+                             matrix m: UnsafePointer<Float>,
+                             into dst: UnsafeMutablePointer<Float>) {
+        if vertices <= 0 { return }
+        ngp_mat4_f32(dst, src, m, Int32(vertices))
     }
 }
 
