@@ -46,7 +46,7 @@ final class GPUEngine: ObservableObject {
             sphereIdx = sphere.indices.count
             torusIdx = torus.indices.count
             fb = try client.alloc(UInt64(fbW * fbH * 4))
-            let vs = NovaGPUStandard.vertexLitProgram()
+            let vs = NovaGPUStandard.vertexLitProgramV4()   // v4: VMAT4 transform (byte-identical output)
             let fs = NovaGPUStandard.fragmentLitProgram()
             let sh = try client.alloc(8192)
             try client.uploadData(sh, data: NovaGPUStandard.programBytes(vs), guestStaging: STAGE)
@@ -223,6 +223,196 @@ struct LiveSceneView: View {
                 GridRow { Text("FPS"); Text(String(format: "%.1f", engine.fps)).bold() }
                 GridRow { Text("VRAM reserved"); Text("\(engine.vramUsedKiB) KiB").bold() }
                 GridRow { Text("Distinct colours"); Text("\(engine.distinctColours)").bold() }
+            }.font(.system(.body, design: .monospaced))
+            Text(engine.statusLine).font(.footnote).foregroundColor(.secondary)
+            Spacer()
+        }
+        .padding()
+        .onAppear { engine.start() }
+    }
+}
+
+// MARK: - v4 Vectors page (plot unit)
+//
+// A vector-display scene rendered ONLY by the plot unit: a
+// rotating wireframe cube (12 edges as plotted line vectors) with
+// its 8 corners plotted as points. No triangle pipeline is
+// involved — the grab unit fetches the corner positions, VPUs run
+// the 3-axis position math (uniforms c0..c3), endpoints land on
+// the 16-bit-per-axis screen grid, and the DDA rasteriser feeds
+// the ordinary fragment path with the c10 colour in slot 1.
+
+final class VectorsEngine: ObservableObject {
+    @Published var frame: CGImage?
+    @Published var fps: Double = 0
+    @Published var frameMs: Double = 0
+    @Published var vectorsPlotted: Int = 0
+    @Published var statusLine: String = "setting up…"
+
+    private let fbW = 640, fbH = 480
+    private let mem = NovaMemory(totalSize: 64 * 1024 * 1024)
+    private let device = NovaGPUDevice()
+    private var client: NovaBusClient!
+    private var fb: UInt64 = 0
+    private var cubeV: UInt64 = 0, lineI: UInt64 = 0, pointI: UInt64 = 0
+    private var ready = false
+    private var angle: Float = 0
+    private var lastTick = Date()
+    private let queue = DispatchQueue(label: "novagpu.vectors", qos: .userInitiated)
+    private var timer: DispatchSourceTimer?
+
+    private let STAGE: UInt64 = 0x40000
+    private let DSTAGE: UInt64 = 0x80000
+
+    func start() {
+        queue.async { [weak self] in self?.setup() }
+    }
+
+    private func setup() {
+        do {
+            client = NovaBusClient(memory: mem, device: device)
+            fb = try client.alloc(UInt64(fbW * fbH * 4))
+            // Flat fragment program: OUT 0 = varying slot 1 (the
+            // plot colour), verbatim.
+            var flat = ShaderBuilder()
+            flat.ldattr(0, 1); flat.out(0, 0); flat.end()
+            let sh = try client.alloc(4096)
+            try client.uploadData(sh, data: NovaGPUStandard.programBytes(flat.build()), guestStaging: STAGE)
+            try client.setShader(.setFShader, programHandle: sh, off: 0, len: flat.build().count * 4)
+            try client.setFBuf(fb, fbW, fbH)
+            // Cube corners (±0.6) as an interleaved vertex buffer
+            // (only positions are read by the plot unit).
+            let c: Float = 0.6
+            let corners: [(Float, Float, Float)] = [
+                (-c, -c, -c), (c, -c, -c), (c, c, -c), (-c, c, -c),
+                (-c, -c, c), (c, -c, c), (c, c, c), (-c, c, c),
+            ]
+            var vdata = [UInt8]()
+            for v in corners {
+                var rec = [Float](repeating: 0, count: 12)
+                rec[0] = v.0; rec[1] = v.1; rec[2] = v.2
+                for f in rec { withUnsafeBytes(of: f.bitPattern) { vdata.append(contentsOf: $0) } }
+            }
+            cubeV = try client.alloc(UInt64(vdata.count))
+            try client.uploadData(cubeV, data: vdata, guestStaging: STAGE)
+            let edges: [UInt32] = [0, 1, 1, 2, 2, 3, 3, 0, 4, 5, 5, 6, 6, 7, 7, 4, 0, 4, 1, 5, 2, 6, 3, 7]
+            var edata = [UInt8]()
+            for i in edges { withUnsafeBytes(of: i) { edata.append(contentsOf: $0) } }
+            lineI = try client.alloc(UInt64(edata.count))
+            try client.uploadData(lineI, data: edata, guestStaging: STAGE)
+            var pdata = [UInt8]()
+            for i in 0..<8 { withUnsafeBytes(of: UInt32(i)) { pdata.append(contentsOf: $0) } }
+            pointI = try client.alloc(UInt64(pdata.count))
+            try client.uploadData(pointI, data: pdata, guestStaging: STAGE)
+            ready = true
+            DispatchQueue.main.async { self.statusLine = "plotting — plot unit only, no triangles" }
+            let t = DispatchSource.makeTimerSource(queue: queue)
+            t.schedule(deadline: .now(), repeating: .milliseconds(16))
+            t.setEventHandler { [weak self] in self?.renderFrame() }
+            t.resume()
+            timer = t
+        } catch {
+            DispatchQueue.main.async { self.statusLine = "setup failed: \(error)" }
+        }
+    }
+
+    private func renderFrame() {
+        guard ready else { return }
+        let t0 = Date()
+        do {
+            angle += 0.03
+            let proj = NovaGPUStandard.matPerspective(k: 0.45)
+            let mvp = NovaGPUStandard.matMul(proj, NovaGPUStandard.matMul(
+                NovaGPUStandard.matRotX(0.6),
+                NovaGPUStandard.matMul(NovaGPUStandard.matRotY(angle), NovaGPUStandard.matScale(0.8))))
+            var batch: [(opcode: GPUCommand, fence: UInt64, args: [UInt64])] = []
+            batch.append((opcode: .clear, fence: 0, args: [UInt64(0xFF0A0A12), 0, 0, 0, 0]))
+            for r in 0..<4 {
+                batch.append((opcode: .setUniform, fence: 0,
+                              args: [UInt64(r),
+                                     UInt64(mvp[r * 4].bitPattern), UInt64(mvp[r * 4 + 1].bitPattern),
+                                     UInt64(mvp[r * 4 + 2].bitPattern), UInt64(mvp[r * 4 + 3].bitPattern)]))
+            }
+            batch.append((opcode: .setVBuf, fence: 0, args: [cubeV, 0, 0, 0, 0]))
+            // Edges in green.
+            batch.append((opcode: .setUniform, fence: 0,
+                          args: [10, UInt64(Float(0.25).bitPattern), UInt64(Float(1.0).bitPattern),
+                                 UInt64(Float(0.35).bitPattern), UInt64(Float(1.0).bitPattern)]))
+            batch.append((opcode: .setIBuf, fence: 0, args: [lineI, 0, 0, 0, 0]))
+            batch.append((opcode: .plotVectors, fence: 0, args: [24, 0, 0, 0, 0]))
+            // Corners as white points.
+            batch.append((opcode: .setUniform, fence: 0,
+                          args: [10, UInt64(Float(1.0).bitPattern), UInt64(Float(1.0).bitPattern),
+                                 UInt64(Float(1.0).bitPattern), UInt64(Float(1.0).bitPattern)]))
+            batch.append((opcode: .setIBuf, fence: 0, args: [pointI, 0, 0, 0, 0]))
+            batch.append((opcode: .plotVectors, fence: 0, args: [8, 1, 0, 0, 0]))
+            batch.append((opcode: .present, fence: 0, args: [fb, 0, 0, 0, 0]))
+            try client.submitBatch(batch)
+            let px = try client.downloadData(fb, len: fbW * fbH * 4, guestStaging: DSTAGE)
+            let img = makeImage(px)
+            let now = Date()
+            let dt = now.timeIntervalSince(lastTick)
+            lastTick = now
+            let ms = now.timeIntervalSince(t0) * 1000
+            let plotted = Int(device.gpu.stats.vectorsPlotted % 100000)
+            DispatchQueue.main.async {
+                self.frame = img
+                self.frameMs = ms
+                if dt > 0 { self.fps = self.fps * 0.8 + (1 / dt) * 0.2 }
+                self.vectorsPlotted = plotted
+            }
+        } catch {
+            DispatchQueue.main.async { self.statusLine = "frame failed: \(error)" }
+        }
+    }
+
+    private var imageBuffers: [NSMutableData] = []
+    private var imageProviders: [CGDataProvider] = []
+    private var imageFlip = 0
+
+    private func makeImage(_ px: [UInt8]) -> CGImage? {
+        let n = fbW * fbH * 4
+        if imageBuffers.isEmpty {
+            for _ in 0..<2 {
+                let d = NSMutableData(length: n)!
+                imageBuffers.append(d)
+                if let p = CGDataProvider(data: d as CFData) { imageProviders.append(p) }
+            }
+            if imageProviders.count != 2 { return nil }
+        }
+        imageFlip = 1 - imageFlip
+        px.withUnsafeBytes { src in
+            if let base = src.baseAddress {
+                imageBuffers[imageFlip].replaceBytes(in: NSRange(location: 0, length: n), withBytes: base)
+            }
+        }
+        let cs = CGColorSpaceCreateDeviceRGB()
+        let info = CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue)
+        return CGImage(width: fbW, height: fbH, bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: fbW * 4, space: cs, bitmapInfo: info,
+                       provider: imageProviders[imageFlip], decode: nil, shouldInterpolate: false,
+                       intent: .defaultIntent)
+    }
+}
+
+struct VectorsView: View {
+    @StateObject private var engine = VectorsEngine()
+    var body: some View {
+        VStack(spacing: 12) {
+            Text("NovaGPU — Vectors (plot unit)").font(.headline)
+            if let img = engine.frame {
+                Image(img, scale: 1, label: Text("NovaGPU vector framebuffer"))
+                    .resizable().aspectRatio(4 / 3, contentMode: .fit)
+                    .border(Color.secondary)
+            } else {
+                Rectangle().fill(Color.black).aspectRatio(4 / 3, contentMode: .fit)
+                    .overlay(Text("warming up…").foregroundColor(.white))
+            }
+            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 4) {
+                GridRow { Text("VPU pool"); Text("\(NovaGPU.vpuCount) VPUs (2 × \(NovaGPU.maxScreenVectors) max screen vectors)").bold() }
+                GridRow { Text("Vectors per frame"); Text("20 (12 edges + 8 points)").bold() }
+                GridRow { Text("Frame time"); Text(String(format: "%.1f ms", engine.frameMs)).bold() }
+                GridRow { Text("FPS"); Text(String(format: "%.1f", engine.fps)).bold() }
             }.font(.system(.body, design: .monospaced))
             Text(engine.statusLine).font(.footnote).foregroundColor(.secondary)
             Spacer()

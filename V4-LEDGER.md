@@ -90,3 +90,27 @@ the judge).
   and so does the Xcode project. Fixed both (ci.yml x3, pbxproj
   build file + file ref + group + sources phase). Lesson logged:
   new source files must be registered in FOUR places.
+
+## Attempt 3 — VPU + plot unit + bus command + v4 vertex program + app Vectors page
+- VPU (NovaGPUVector.swift): one triangle workload (3 grabbed
+  positions, 9 axis values + w), 3-axis calculator = ngp_mat4,
+  positioned clip triangle out. Pool: NovaGPU.vpuCount =
+  2 x maxScreenVectors (4096 placeholder -> 8192 VPUs).
+- ScreenSpace: SCREEN_AXIS_BITS=16, Q10.6 grid (64 sub-steps/px),
+  clamped Float->Int conversion (no traps on off-screen/NaN).
+- NovaGPU.plotVectors(indexCount:mode:): grab -> VPU-position ->
+  skip w<=0/non-finite -> grid -> DDA -> depth test identical to
+  triangles -> per-chunk FragBatcher shading (slot 1 = uniform
+  c10 colour, other slots 0). Bus: GPUCommand.plotVectors = 19 +
+  NovaBusClient.plot. Stats: vectorsPlotted.
+- NovaGPUStandard.vertexLitProgramV4: VMAT4 replaces DOT4x4+SEL
+  assembly for clip; normal path unchanged.
+- HostTests section 9: VPU == VMAT4 bit-exact; grid within 1 unit
+  of Double reference (2000 random endpoints) + exact on dyadic;
+  full-frame plot of 3 crafted vectors == Double-DDA pixel set
+  EXACTLY; endpoints on the full-pipeline pixels; points mode
+  exact. Section 10: v4 vertex program frame byte-identical to v1
+  over the proof cube.
+- App: Vectors tab (plot-unit wireframe cube + corner points,
+  FPS readout); Live Scene now uses vertexLitProgramV4.
+- Status: pushed behind the attempt-2 fix run; awaiting both.

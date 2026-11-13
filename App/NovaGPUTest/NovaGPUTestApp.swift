@@ -20,6 +20,8 @@ struct ContentView: View {
         TabView {
             LiveSceneView()
                 .tabItem { Label("Live Scene", systemImage: "cube.transparent") }
+            VectorsView()
+                .tabItem { Label("Vectors", systemImage: "scribble.variable") }
             SelfTestView()
                 .tabItem { Label("Self-Tests", systemImage: "checklist") }
             CPUProofView()

@@ -208,4 +208,9 @@ final class NovaBusClient {
         _ = try submit(opcode: .launch, args: [UInt64(lanes), buffer, 0, 0, 0])
     }
     func present(_ fb: UInt64) throws { _ = try submit(opcode: .present, args: [fb, 0, 0, 0, 0]) }
+    /// v4 plot unit: mode 0 = lines (index pairs), 1 = points.
+    /// Transform = uniforms c0..c3; plot colour = uniform c10.
+    func plot(indexCount: Int, mode: Int) throws {
+        _ = try submit(opcode: .plotVectors, args: [UInt64(indexCount), UInt64(mode), 0, 0, 0])
+    }
 }

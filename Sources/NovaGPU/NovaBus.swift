@@ -88,6 +88,9 @@ enum GPUCommand: UInt64 {
     case launch     = 16   // a0=lane count, a1=target buffer handle
     case fenceCmd   = 17   // a0=fence value to publish on completion
     case present    = 18   // a0=framebuffer handle (marks present-ready)
+    case plotVectors = 19  // v4 plot unit: a0=index count, a1=mode
+                           // (0 = lines from index pairs, 1 = points);
+                           // transform = uniforms c0..c3, colour = c10
 }
 
 enum GPUErrorCode: UInt64 {
@@ -393,6 +396,8 @@ final class NovaGPUDevice {
                     return suspendForAsset(&desc)
                 }
                 _ = try gpu.draw(indexCount: Int(desc.args[0]))
+            case .plotVectors:
+                _ = try gpu.plotVectors(indexCount: Int(desc.args[0]), mode: Int(desc.args[1]))
             case .launch:
                 try gpu.launchCompute(lanes: Int(desc.args[0]), buffer: desc.args[1])
             case .fenceCmd:

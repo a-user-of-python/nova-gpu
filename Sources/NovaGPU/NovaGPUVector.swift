@@ -71,6 +71,21 @@ enum GrabUnit {
             d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = 1
         }
     }
+
+    /// Grab one triangle workload's positions: 3 INDEXED vertices
+    /// (the VPU's fetch — a line loads its second endpoint twice,
+    /// a point three times) into [3][vec4] with w = 1.
+    static func grabTrianglePositions(snapshot src: UnsafePointer<Float>,
+                                      _ i0: Int, _ i1: Int, _ i2: Int,
+                                      into dst: UnsafeMutablePointer<Float>) {
+        let idx = (i0, i1, i2)
+        for v in 0..<3 {
+            let vi = v == 0 ? idx.0 : (v == 1 ? idx.1 : idx.2)
+            let s = src + vi * 12
+            let d = dst + v * 4
+            d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = 1
+        }
+    }
 }
 
 /// Screen-space coordinate format for the plot unit: each axis is
@@ -84,10 +99,10 @@ enum ScreenSpace {
     static let scale: Float = 64    // 1 << fracBits
 
     /// Convert a projected NDC point to grid coordinates: NDC → pixel
-    /// float (the triangle pipeline's viewport transform, same
-    /// expressions) → grid by one FP32 multiply and a truncation
-    /// (Float→Int truncates toward zero, matching Int(...) on the
-    /// pixel float in rasterisePoints). The pixel float is clamped
+    /// float (the triangle pipeline's viewport transform — the same
+    /// expressions screenOf uses in draw()) → grid by one FP32
+    /// multiply and a truncation (Float→Int truncates toward zero).
+    /// The pixel float is clamped
     /// to a generous margin around the framebuffer first: Float→Int
     /// traps on out-of-range or non-finite values, and off-screen
     /// endpoints only need to stay ordered for the rasteriser —
@@ -154,24 +169,24 @@ struct VPU {
 /// Pixel-exactness contract (host-tested): a plotted vector's
 /// endpoint pixels equal the pixels the same endpoints land on
 /// when projected through the full pipeline and rounded to the
-/// grid; the drawn pixel SET equals the set produced by the
-/// reference DDA below sampled on the same grid. The reference
-/// implementation (NovaGPU.plotVectorsReference) renders the same
-/// command through the ordinary point rasteriser in Double
-/// precision as a cross-check.
+/// grid; the drawn pixel SET equals the set produced by a
+/// Double-precision implementation of the same DDA spec, which
+/// the host tests carry as the reference.
 enum PlotUnit {
-    /// Rasterise one vector (two grid endpoints) into a bin
-    /// callback, DDA-sampled at grid resolution: steps = the
-    /// Chebyshev distance in grid units, one fragment per step,
-    /// coordinates rounded (half away from zero, matching Int()
-    /// truncation of value + 0.5 for the non-negative coordinates
-    /// that survive clipping). Grid points outside the framebuffer
-    /// are clipped by the binning stage, as triangle fragments are.
+    /// Rasterise one vector (two grid endpoints) one sample at a
+    /// time, DDA-sampled at grid resolution: steps = the Chebyshev
+    /// distance in grid units, one sample per step, coordinates
+    /// rounded via Int(value + 0.5) truncation (round-half-up for
+    /// the non-negative coordinates that survive clipping; samples
+    /// outside the framebuffer are dropped by the caller, as the
+    /// triangle pipeline's binning drops them). The callback also
+    /// receives the step index and count so the caller can
+    /// interpolate depth along the vector.
     static func rasterizeLine(x0: Int, y0: Int, x1: Int, y1: Int,
-                              emit: (Int, Int) -> Void) {
+                              emit: (Int, Int, Int, Int) -> Void) {
         let steps = max(abs(x1 - x0), abs(y1 - y0))
         if steps == 0 {
-            emit(x0, y0)
+            emit(x0, y0, 0, 0)
             return
         }
         let fs = Float(steps)
@@ -179,7 +194,7 @@ enum PlotUnit {
             let t = Float(s) / fs
             let gx = Float(x0) + Float(x1 - x0) * t
             let gy = Float(y0) + Float(y1 - y0) * t
-            emit(Int(gx + 0.5), Int(gy + 0.5))
+            emit(Int(gx + 0.5), Int(gy + 0.5), s, steps)
         }
     }
 }

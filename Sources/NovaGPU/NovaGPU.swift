@@ -976,6 +976,193 @@ final class NovaGPU {
         return ms
     }
 
+    /// v4 plot unit: plots 3D vectors from the current vertex and
+    /// index buffers, bypassing the triangle pipeline. Mode 0 =
+    /// lines (index pairs), mode 1 = points (one per index). The
+    /// transform is the uniform matrix c0..c3 (row-major, the same
+    /// uniforms the standard vertex shader consumes) and the plot
+    /// colour is uniform c10, delivered to the fragment program as
+    /// varying slot 1 — the slot the standard lit fragment program
+    /// reads as colour (it modulates by its lighting, like any
+    /// fragment); a flat fragment program (LDATTR 1 -> OUT 0)
+    /// shows the c10 colour verbatim.
+    ///
+    /// Path per vector: the grab unit fetches the endpoint
+    /// positions, a VPU runs the 3-axis calculator (ngp_mat4 —
+    /// bit-identical to the shader stage's VMAT4), endpoints with
+    /// w <= 0 or non-finite clip are skipped (the same rule the
+    /// clip stage applies), survivors convert to the 16-bit-per-
+    /// axis screen grid, and the DDA rasteriser emits samples that
+    /// depth-test exactly like triangle fragments (larger NDC z is
+    /// nearer; buffer clears to -1). Depth interpolates linearly
+    /// in screen space along the vector. Indices outside the
+    /// vertex buffer are skipped. Returns frame time in ms.
+    @discardableResult
+    func plotVectors(indexCount: Int, mode: Int) throws -> Double {
+        let t0 = Date()
+        guard !fragmentProgram.isEmpty else { throw GPUError.badProgram }
+        guard let vbSize = allocationSize(vertexBuffer) else { throw GPUError.badHandle(vertexBuffer) }
+        guard let ibSize = allocationSize(indexBuffer) else { throw GPUError.badHandle(indexBuffer) }
+        guard let fbAllocSize = allocationSize(framebuffer), fbWidth > 0, fbHeight > 0 else { throw GPUError.badState("no framebuffer") }
+        let vertexCount = Int(vbSize / 48)
+        var idxCount = min(indexCount, Int(ibSize / 4))
+        if mode == 0 { idxCount -= idxCount % 2 }
+        guard idxCount > 0 else { return 0 }
+        let width = fbWidth, height = fbHeight
+        let fDecoded = DecodedShader(fragmentProgram)
+        let unis = uniforms
+        func u(_ i: Int) -> Float { i < unis.count ? unis[i] : 0 }
+
+        let vbFloats = UnsafeMutablePointer<Float>.allocate(capacity: max(vertexCount * 12, 1))
+        defer { vbFloats.deallocate() }
+        vramRead(at: vertexBuffer, count: vertexCount * 48).withUnsafeBufferPointer { src in
+            if let sp = src.baseAddress, vertexCount > 0 {
+                memcpy(vbFloats, sp, vertexCount * 48)
+            }
+        }
+        let ibWords = UnsafeMutablePointer<UInt32>.allocate(capacity: max(idxCount, 1))
+        defer { ibWords.deallocate() }
+        vramRead(at: indexBuffer, count: idxCount * 4).withUnsafeBufferPointer { src in
+            if let sp = src.baseAddress, idxCount > 0 {
+                memcpy(ibWords, sp, idxCount * 4)
+            }
+        }
+
+        let depthPtr = UnsafeMutablePointer<Float>.allocate(capacity: width * height)
+        depthPtr.initialize(repeating: -1.0, count: width * height)
+        defer { depthPtr.deinitialize(count: width * height); depthPtr.deallocate() }
+        let chunkRows = 4
+        let chunkCount = (height + chunkRows - 1) / chunkRows
+        var chunkPx: [[Int]] = [[Int]](repeating: [], count: chunkCount)
+
+        // Pass 1 (serial, index order = draw order): position,
+        // project, rasterise, depth-test; collect accepted pixels
+        // per row chunk in order.
+        var vpu = VPU()
+        var plotted: UInt64 = 0
+        withUnsafeTemporaryAllocation(of: Float.self, capacity: 16) { mbuf in
+            mbuf.initialize(repeating: 0)
+            for i in 0..<16 { mbuf[i] = u(i) }
+            let mPtr = mbuf.baseAddress!
+            withUnsafeTemporaryAllocation(of: Float.self, capacity: 12) { scratch in
+                scratch.initialize(repeating: 0)
+                let sPtr = scratch.baseAddress!
+                withUnsafeTemporaryAllocation(of: Float.self, capacity: 12) { clipBuf in
+                    clipBuf.initialize(repeating: 0)
+                    let cPtr = clipBuf.baseAddress!
+                    let vectorCount = mode == 0 ? idxCount / 2 : idxCount
+                    for v in 0..<vectorCount {
+                        let i0 = Int(ibWords[mode == 0 ? v * 2 : v])
+                        let i1 = mode == 0 ? Int(ibWords[v * 2 + 1]) : i0
+                        guard i0 < vertexCount, i1 < vertexCount else { continue }
+                        GrabUnit.grabTrianglePositions(snapshot: vbFloats, i0, i1, i0, into: sPtr)
+                        vpu.load(positions: sPtr)
+                        vpu.position(matrix: mPtr, into: cPtr)
+                        // Endpoint 0 (and 1 for lines): skip on
+                        // w <= 0 / non-finite, as the clip stage does.
+                        let w0 = cPtr[3]
+                        guard w0 > 0, w0.isFinite else { continue }
+                        let iw0 = 1 / w0
+                        let nx0 = cPtr[0] * iw0, ny0 = cPtr[1] * iw0, nz0 = cPtr[2] * iw0
+                        guard nx0.isFinite, ny0.isFinite, nz0.isFinite else { continue }
+                        let gx0 = ScreenSpace.gridX(nx0, width: width)
+                        let gy0 = ScreenSpace.gridY(ny0, height: height)
+                        if mode == 1 {
+                            let px = ScreenSpace.pixel(gx0), py = ScreenSpace.pixel(gy0)
+                            if px >= 0 && px < width && py >= 0 && py < height {
+                                let di = py * width + px
+                                if nz0 >= 0 && nz0 >= depthPtr[di] {
+                                    depthPtr[di] = nz0
+                                    chunkPx[py / chunkRows].append(di)
+                                }
+                            }
+                            plotted += 1
+                            continue
+                        }
+                        let w1 = cPtr[7]
+                        guard w1 > 0, w1.isFinite else { continue }
+                        let iw1 = 1 / w1
+                        let nx1 = cPtr[4] * iw1, ny1 = cPtr[5] * iw1, nz1 = cPtr[6] * iw1
+                        guard nx1.isFinite, ny1.isFinite, nz1.isFinite else { continue }
+                        let gx1 = ScreenSpace.gridX(nx1, width: width)
+                        let gy1 = ScreenSpace.gridY(ny1, height: height)
+                        plotted += 1
+                        PlotUnit.rasterizeLine(x0: gx0, y0: gy0, x1: gx1, y1: gy1) { gx, gy, s, steps in
+                            let px = ScreenSpace.pixel(gx), py = ScreenSpace.pixel(gy)
+                            guard px >= 0 && px < width && py >= 0 && py < height else { return }
+                            let z = steps == 0 ? nz0 : nz0 + (nz1 - nz0) * (Float(s) / Float(steps))
+                            let di = py * width + px
+                            if z >= 0 && z >= depthPtr[di] {
+                                depthPtr[di] = z
+                                chunkPx[py / chunkRows].append(di)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stats.vectorsPlotted += plotted
+
+        // Pass 2: shade the accepted pixels per row chunk through
+        // the ordinary fragment path (one FragBatcher per chunk,
+        // pixels in acceptance order — the draw() protocol).
+        let fbBlocks = blockPointers(addr: framebuffer, size: fbAllocSize)
+        let fbFirstBlock = blockIndex(framebuffer)
+        let fb = framebuffer
+        let colour = (u(40), u(41), u(42), u(43))   // uniform c10
+        let chunkOps = UnsafeMutablePointer<UInt64>.allocate(capacity: chunkCount)
+        let chunkFrags = UnsafeMutablePointer<UInt64>.allocate(capacity: chunkCount)
+        let chunkWarps = UnsafeMutablePointer<UInt64>.allocate(capacity: chunkCount)
+        for p in [chunkOps, chunkFrags, chunkWarps] { p.initialize(repeating: 0, count: chunkCount) }
+        defer {
+            for p in [chunkOps, chunkFrags, chunkWarps] {
+                p.deinitialize(count: chunkCount); p.deallocate()
+            }
+        }
+        fbBlocks.withUnsafeBufferPointer { fbTable in
+            DispatchQueue.concurrentPerform(iterations: chunkCount) { chunk in
+                let list = chunkPx[chunk]
+                if list.isEmpty { return }
+                let warpPx = UnsafeMutablePointer<Int>.allocate(capacity: 32)
+                let warpVar = UnsafeMutablePointer<Float>.allocate(capacity: 32 * 32)
+                let warpCol = UnsafeMutablePointer<Float>.allocate(capacity: 32 * 4)
+                defer { warpPx.deallocate(); warpVar.deallocate(); warpCol.deallocate() }
+                let batcher = FragBatcher(
+                    px: warpPx, vars: warpVar, col: warpCol,
+                    decoded: fDecoded, unis: unis,
+                    texSampler: { [self] unit, uu, vv in self.sampleTexture(unit: unit, u: uu, v: vv) },
+                    fbTable: fbTable, fbFirstBlock: fbFirstBlock, fb: fb,
+                    fbFallback: { [self] addr, bytes in self.vramWrite(at: addr, bytes: bytes) })
+                for di in list {
+                    let base = batcher.count * 32
+                    for i in 0..<32 { warpVar[base + i] = 0 }
+                    warpVar[base + 4] = colour.0
+                    warpVar[base + 5] = colour.1
+                    warpVar[base + 6] = colour.2
+                    warpVar[base + 7] = colour.3
+                    warpPx[batcher.count] = di
+                    batcher.count += 1
+                    if batcher.count == 32 { batcher.flush() }
+                }
+                batcher.flush()
+                chunkOps[chunk] = batcher.ops
+                chunkFrags[chunk] = batcher.frags
+                chunkWarps[chunk] = batcher.warps
+            }
+        }
+        var fragWarps: UInt64 = 0
+        for c in 0..<chunkCount {
+            stats.lanesPerCluster[c % Self.clusterCount] += chunkOps[c]
+            stats.laneOps += chunkOps[c]
+            stats.fragmentsShaded += chunkFrags[c]
+            fragWarps += chunkWarps[c]
+        }
+        stats.warpsIssued += fragWarps
+        let ms = Date().timeIntervalSince(t0) * 1000
+        stats.lastFrameMs = ms
+        return ms
+    }
+
     // Sutherland–Hodgman clipping against the 6 clip planes, in clip
     // space (before the perspective divide), interpolating varyings.
     // Only the fragment-readable slots are interpolated at clip points

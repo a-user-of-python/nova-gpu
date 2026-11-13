@@ -411,5 +411,193 @@ do {
     check(matZOK, "VMAT4 rows past the uniform file read as zero")
 }
 
+// MARK: 9. v4 vector hardware: VPU, plot unit, screen grid
+do {
+    // 9a. VPU.position is bit-identical to the shader stage's
+    // VMAT4 on the same triangle workload (both are ngp_mat4, but
+    // prove the VPU's load/axes plumbing preserves it).
+    let triPos: [Float] = [0.5, -1.25, 2.0, 1, -0.75, 0.33, 1.5, 1, 3.25, 2.5, -0.125, 1]
+    let mat: [Float] = [0.8, 0.1, -0.3, 0.5, -0.2, 1.1, 0.4, -0.6,
+                        0.9, -0.7, 0.3, 0.25, -0.1, 0.2, 0.45, 1.0]
+    var vpu = VPU()
+    let vpuOut = UnsafeMutablePointer<Float>.allocate(capacity: 12)
+    defer { vpuOut.deallocate() }
+    triPos.withUnsafeBufferPointer { tp in
+        mat.withUnsafeBufferPointer { mp in
+            vpu.load(positions: tp.baseAddress!)
+            vpu.position(matrix: mp.baseAddress!, into: vpuOut)
+        }
+    }
+    var vb = ShaderBuilder()
+    vb.ldattr(0, 0); vb.vmat4(1, 0, rows: 0); vb.out(0, 1); vb.end()
+    var vctx = WarpContext.dummy()
+    var unis = [Float](repeating: 0, count: 64)
+    for i in 0..<16 { unis[i] = mat[i] }
+    vctx.uniforms = unis
+    var vmatOut: [(Float, Float, Float, Float)] = []
+    vctx.attrProvider = { lane, _ in
+        (triPos[lane * 4], triPos[lane * 4 + 1], triPos[lane * 4 + 2], triPos[lane * 4 + 3])
+    }
+    vctx.outWriter = { _, slot, x, y, z, w in if slot == 0 { vmatOut.append((x, y, z, w)) } }
+    _ = ShaderExecutor.runWarp(program: vb.build(), lanes: 3, ctx: vctx)
+    var vpuOK = vmatOut.count == 3
+    for v in 0..<3 {
+        let o = vmatOut[v]
+        if o.0.bitPattern != vpuOut[v * 4].bitPattern || o.1.bitPattern != vpuOut[v * 4 + 1].bitPattern
+            || o.2.bitPattern != vpuOut[v * 4 + 2].bitPattern || o.3.bitPattern != vpuOut[v * 4 + 3].bitPattern {
+            vpuOK = false
+        }
+    }
+    check(vpuOK, "VPU 3-axis calculator is bit-identical to shader VMAT4")
+
+    // 9b. Screen grid: FP32 projection lands within 1 grid unit
+    // (1/64 px) of the Double-precision reference on random NDC
+    // endpoints, and exactly on it for dyadic coordinates.
+    var rng: UInt64 = 0x12345678
+    func frand() -> Float {
+        rng = rng &* 6364136223846793005 &+ 1442695040888963407
+        return Float((rng >> 40) & 0xFFFFFF) / Float(0x1000000) * 2 - 1
+    }
+    var gridOK = true
+    for _ in 0..<2000 {
+        let nx = frand(), ny = frand()
+        let gx = ScreenSpace.gridX(nx, width: 2360), gy = ScreenSpace.gridY(ny, height: 1640)
+        let dgx = Int((Double(nx) + 1) * 0.5 * 2360.0 * 64.0)
+        let dgy = Int((1 - Double(ny)) * 0.5 * 1640.0 * 64.0)
+        if abs(gx - dgx) > 1 || abs(gy - dgy) > 1 { gridOK = false }
+    }
+    check(gridOK, "screen grid (16 bits/axis, Q10.6) within 1 grid unit of Double reference")
+    check(ScreenSpace.gridX(-0.75, width: 128) == 1024 && ScreenSpace.gridY(0.5, height: 96) == 1536,
+          "screen grid exact on dyadic coordinates")
+
+    // 9c. Full-frame plot: three crafted vectors whose samples are
+    // exact in both Float and Double (integer grid endpoints,
+    // dyadic step counts) must produce EXACTLY the Double-DDA
+    // reference pixel set, in the c10 colour, via the bus.
+    let fbW = 128, fbH = 96
+    let fb = try client.alloc(UInt64(fbW * fbH * 4))
+    // positions only matter; normals/uv/colour are unused by plot
+    let verts: [[Float]] = [
+        [-0.75, 0.5, 0.5],   // 0 -> pixel (16, 24)
+        [0.75, 0.5, 0.5],    // 1 -> pixel (112, 24)
+        [-0.5, 0.75, 0.5],   // 2 -> pixel (32, 12)
+        [-0.5, -0.75, 0.5],  // 3 -> pixel (32, 84)
+        [-0.75, 0.75, 0.5],  // 4 -> pixel (16, 12)
+        [-0.25, 0.25, 0.5],  // 5 -> pixel (48, 36)
+    ]
+    var vdata = [UInt8]()
+    for v in verts {
+        var rec = [Float](repeating: 0, count: 12)
+        rec[0] = v[0]; rec[1] = v[1]; rec[2] = v[2]
+        for f in rec { withUnsafeBytes(of: f.bitPattern) { vdata.append(contentsOf: $0) } }
+    }
+    let vbh = try client.alloc(UInt64(vdata.count))
+    try client.uploadData(vbh, data: vdata, guestStaging: STAGE)
+    let idx: [UInt32] = [0, 1, 2, 3, 4, 5]
+    var idata = [UInt8]()
+    for i in idx { withUnsafeBytes(of: i) { idata.append(contentsOf: $0) } }
+    let ibh = try client.alloc(UInt64(idata.count))
+    try client.uploadData(ibh, data: idata, guestStaging: STAGE)
+    var flat = ShaderBuilder()
+    flat.ldattr(0, 1); flat.out(0, 0); flat.end()
+    let flatProg = NovaGPUStandard.programBytes(flat.build())
+    let sh = try client.alloc(4096)
+    try client.uploadData(sh, data: flatProg, guestStaging: STAGE)
+    try client.setShader(.setFShader, programHandle: sh, off: 0, len: flatProg.count)
+    try client.setFBuf(fb, fbW, fbH)
+    try client.setVBuf(vbh)
+    try client.setIBuf(ibh)
+    let ident: [Float] = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+    for r in 0..<4 { try client.setUniform(r, (ident[r * 4], ident[r * 4 + 1], ident[r * 4 + 2], ident[r * 4 + 3])) }
+    try client.setUniform(10, (1.0, 0.5, 0.25, 1.0))
+    let plottedBefore = device.gpu.stats.vectorsPlotted
+    try client.clear(0xFF000000)
+    try client.plot(indexCount: idx.count, mode: 0)
+    try client.present(fb)
+    let px = try client.downloadData(fb, len: fbW * fbH * 4, guestStaging: DSTAGE)
+    func wordAt(_ x: Int, _ y: Int) -> UInt32 {
+        let o = (y * fbW + x) * 4
+        return UInt32(px[o]) | (UInt32(px[o + 1]) << 8) | (UInt32(px[o + 2]) << 16) | (UInt32(px[o + 3]) << 24)
+    }
+    let colourWord: UInt32 = 0xFF3F7FFF   // (1.0, 0.5, 0.25, 1.0) as RGBA8888 bytes
+    var actual = Set<Int>()
+    for y in 0..<fbH { for x in 0..<fbW where wordAt(x, y) == colourWord { actual.insert(y * fbW + x) } }
+    func expectedLine(_ gx0: Int, _ gy0: Int, _ gx1: Int, _ gy1: Int) -> Set<Int> {
+        var set = Set<Int>()
+        let steps = max(abs(gx1 - gx0), abs(gy1 - gy0))
+        if steps == 0 { set.insert((gy0 >> 6) * fbW + (gx0 >> 6)); return set }
+        for s in 0...steps {
+            let t = Double(s) / Double(steps)
+            let gx = Double(gx0) + Double(gx1 - gx0) * t
+            let gy = Double(gy0) + Double(gy1 - gy0) * t
+            let ex = Int(gx + 0.5) >> 6, ey = Int(gy + 0.5) >> 6
+            if ex >= 0 && ex < fbW && ey >= 0 && ey < fbH { set.insert(ey * fbW + ex) }
+        }
+        return set
+    }
+    var expected = Set<Int>()
+    expected.formUnion(expectedLine(1024, 1536, 7168, 1536))   // horizontal
+    expected.formUnion(expectedLine(2048, 768, 2048, 5376))    // vertical
+    expected.formUnion(expectedLine(1024, 768, 3072, 2304))    // diagonal
+    check(actual == expected, "plot lines: pixel set exactly matches the Double DDA reference",
+          "actual \(actual.count) px, expected \(expected.count) px, symdiff \(actual.symmetricDifference(expected).count)")
+    let endpoints: [(Int, Int)] = [(16, 24), (112, 24), (32, 12), (32, 84), (16, 12), (48, 36)]
+    check(endpoints.allSatisfy { wordAt($0.0, $0.1) == colourWord },
+          "plot endpoints land on the full-pipeline pixels")
+    check(device.gpu.stats.vectorsPlotted == plottedBefore + 3, "vectorsPlotted accounted (3)")
+
+    // 9d. Points mode: exactly the two endpoint pixels.
+    try client.clear(0xFF000000)
+    try client.plot(indexCount: 2, mode: 1)   // indices 0, 1 as points
+    let px2 = try client.downloadData(fb, len: fbW * fbH * 4, guestStaging: DSTAGE)
+    var pts = Set<Int>()
+    for y in 0..<fbH {
+        for x in 0..<fbW {
+            let o = (y * fbW + x) * 4
+            let w = UInt32(px2[o]) | (UInt32(px2[o + 1]) << 8) | (UInt32(px2[o + 2]) << 16) | (UInt32(px2[o + 3]) << 24)
+            if w == colourWord { pts.insert(y * fbW + x) }
+        }
+    }
+    check(pts == [24 * fbW + 16, 24 * fbW + 112], "plot points mode draws exactly the indexed points",
+          "\(pts.count) px")
+} catch {
+    check(false, "vector hardware suite", "\(error)")
+}
+
+// MARK: 10. v4 standard vertex program renders bit-identically to v1
+do {
+    let cube = NovaGPUStandard.proofCube()
+    let fbW = 256, fbH = 192
+    let fb = try client.alloc(UInt64(fbW * fbH * 4))
+    let vb = try client.alloc(UInt64(cube.vertices.count * 4))
+    let ib = try client.alloc(UInt64(cube.indices.count * 4))
+    try client.uploadData(vb, data: NovaGPUStandard.vertexBytes(cube), guestStaging: STAGE)
+    try client.uploadData(ib, data: NovaGPUStandard.indexBytes(cube), guestStaging: STAGE)
+    let fs = NovaGPUStandard.fragmentLitProgram()
+    let sh = try client.alloc(8192)
+    try client.uploadData(sh, off: 4096, data: NovaGPUStandard.programBytes(fs), guestStaging: STAGE)
+    try client.setShader(.setFShader, programHandle: sh, off: 4096, len: fs.count * 4)
+    try client.setFBuf(fb, fbW, fbH)
+    try client.setVBuf(vb)
+    try client.setIBuf(ib)
+    let mvp: [Float] = [0.8, 0, 0, 0, 0, 0.8, 0, 0, 0, 0, 0.5, 0.5, 0, 0, 0, 1]
+    try NovaGPUStandard.setLitUniforms(client, mvp: mvp, light: (0.5, 1.0, 0.25))
+
+    func renderWith(_ vs: [UInt32]) throws -> [UInt8] {
+        try client.uploadData(sh, data: NovaGPUStandard.programBytes(vs), guestStaging: STAGE)
+        try client.setShader(.setVShader, programHandle: sh, off: 0, len: vs.count * 4)
+        try client.clear(0xFF200810)
+        try client.draw(indexCount: cube.indices.count)
+        try client.present(fb)
+        return try client.downloadData(fb, len: fbW * fbH * 4, guestStaging: DSTAGE)
+    }
+    let frameV1 = try renderWith(NovaGPUStandard.vertexLitProgram())
+    let frameV4 = try renderWith(NovaGPUStandard.vertexLitProgramV4())
+    check(frameV1 == frameV4, "vertexLitProgramV4 (VMAT4) frame is byte-identical to v1 (DOT4+SEL)",
+          "\(frameV1.count) bytes compared")
+} catch {
+    check(false, "v4 vertex program suite", "\(error)")
+}
+
 print(failures == 0 ? "\nALL HOST TESTS PASSED" : "\n\(failures) HOST TEST(S) FAILED")
 exit(failures == 0 ? 0 : 1)

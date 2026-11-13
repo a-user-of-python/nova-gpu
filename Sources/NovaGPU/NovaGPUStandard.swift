@@ -46,6 +46,35 @@ enum NovaGPUStandard {
 
     /// Fragment shader: diffuse-lit colour. shade = 0.25 + 0.75 *
     /// max(dot(n, light), 0); alpha forced to the interpolated alpha.
+    /// v4 lit vertex program: identical outputs to
+    /// vertexLitProgram(), with the clip transform computed by one
+    /// VMAT4 (the vector unit's matrix op) instead of four DOT4s
+    /// plus the SEL component assembly. Bit-identical by
+    /// construction — VMAT4's components ARE the DOT4 rows — and
+    /// proven so at frame level in the host tests (the same scene
+    /// rendered through both programs must produce identical
+    /// framebuffer bytes).
+    static func vertexLitProgramV4() -> [UInt32] {
+        var b = ShaderBuilder()
+        b.ldattr(0, 0)            // r0 = position (x, y, z, 1)
+        b.vmat4(8, 0, rows: 0)    // r8 = MVP * position
+        b.out(0, 8)
+        // Normal: rotate by rows 0..2 with DOT3 (as v1).
+        b.ldattr(2, 1)            // r2 = normal
+        b.ldunif(1, 0); b.dot3(4, 2, 1)
+        b.ldunif(1, 1); b.dot3(5, 2, 1)
+        b.ldunif(1, 2); b.dot3(6, 2, 1)
+        b.movi(9, 0)
+        b.ldunif(1, 4); b.sel(9, 1, 4)
+        b.ldunif(1, 5); b.sel(9, 1, 5)
+        b.ldunif(1, 6); b.sel(9, 1, 6)
+        b.out(2, 9)
+        b.ldattr(3, 3); b.out(1, 3)   // colour
+        b.ldattr(3, 2); b.out(3, 3)   // uv
+        b.end()
+        return b.build()
+    }
+
     static func fragmentLitProgram() -> [UInt32] {
         var b = ShaderBuilder()
         b.ldattr(0, 1)            // colour
