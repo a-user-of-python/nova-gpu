@@ -77,11 +77,63 @@ CPU proof: driver run 0.03 s (the guest program is short —
 the governor's CPU slice A/B in the proof is a mechanism
 demonstration at this workload size, reported as such).
 
-## Attempt 1 — governor chip (host evidence)
+## Attempt 1–2 — governor chip (host evidence)
 
-(To be filled from the attempt-1 CI run: section 13 results,
-governor-on vs governor-off engine series.)
+CI run 43509439822 (chip + host tests): section 13 all PASS —
+MMIO identity/enable/tick/readback, ring opcode 21 enable and
+disable, and the scripted policy traces behave exactly as
+designed: 30 ms frames walk the pace tier 16.7 → 33.3 ms, 8 ms
+frames walk it back to 16.7; scripted jitter refines the grain
+4 → 2 then caps GPU width at 6, stability restores both;
+disable mid-adaptation restores the v5 operating point; the
+CPU slice halves 100k → 12.5k under 9 ms slices, doubles back
+inside the rule, and holds in the deadband; scratch sheds at
+300 MB VRAM committed and restores at 10 MB. Frames render
+byte-identically with raw knobs twisted (grain 1, width 1,
+clip 4) and with the chip attached, enabled and ticked.
+
+CI run 43512829206 (app integration + bench A/B; a healthy
+runner — the app scene read frame 13.7 ms / host 73 FPS this
+run vs 24.0 ms on the loaded baseline run, so only same-run
+comparisons follow):
+
+**Governor-paced series vs unpaced control, same run:**
+unpaced work series — mean 14.85 ms, stdev 2.12, p95 18.99.
+Governor-paced intervals — mean 28.14, **stdev 9.87**, p95
+45.98, with the chip acting as designed (grain → 2 at tick 30
+on a measured 9.3 ms jitter over a 23.3 ms median; pace tier
+→ 20.8 ms at tick 60). **The pacing made host intervals worse,
+not better — convicted cause: Thread.sleep overshoot.** The
+first pacer slept until each deadline; on a loaded host the
+wake lands 1–8 ms late, which is larger than the variance
+being removed. The pacer now sleeps only down to the last
+~1 ms and spins the remainder (`governorWait`), in both the
+app and this bench (identical code path); the bench also
+prints the settled tail of the series (post window+cooldown)
+alongside the full run. Re-measurement lands with the final
+CI run below.
+
+**CPU proof A/B, same run:** fixed 100k slices 0.03 s / 66
+slices; governor-supervised 0.06 s / 36 slices — both runs
+pass the full battery (GPU OK + checksum match). The chip's
+log shows it steering (100k → 200k → 400k on sub-ms slices,
+halving at a 3.1 ms slice). At this workload the supervised
+run is *slower* on wall: the driver spin-waits for GPU
+service, so longer slices mean longer waits. Two honest
+consequences: the slice cap came down 400k → 200k (a slice
+stays within roughly one 2 ms latency band), and the claim
+for the CPU actuator is the mechanism + log, not a wall win
+on a 30 ms toy run — its value is under real CPU/GPU
+contention, which the proof workload barely creates.
 
 ## Attempt 3 — scratch reuse (host evidence)
 
-(To be filled from the attempt-3 CI run.)
+Same-run A/B (CI run 43512829206), app scene: retention ON
+13.09 ms frame (snapshot 0.161, raster 9.675) vs OFF 13.31 ms
+(snapshot 0.180, raster 10.263) — about 0.2 ms per frame
+(~1.6%), consistent across all three reported stages. The
+bigger device-side expectation is not the mean: it is the
+removal of several MB of malloc/mmap churn per draw, a
+classic per-frame jitter source that a shared CI runner
+cannot price. Checksums unchanged with retention on (it is
+the default in every test above).
