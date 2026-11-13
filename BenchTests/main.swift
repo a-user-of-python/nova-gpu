@@ -551,6 +551,105 @@ do {
               "p50_ms=\(ms(pct(s, 0.50))) p95_ms=\(ms(pct(s, 0.95))) max_ms=\(ms(s.max() ?? 0)) " +
               "min_ms=\(ms(s.min() ?? 0)) fps_at_mean=\(ms(1000 / max(mean(s), 0.001)))")
     }
+
+    // 10. v6 governor A/B: the section-9 loop with the supervisor
+    //     chip attached, enabled over the ring, and the app's
+    //     deadline pacing applied (frame starts held to the chip's
+    //     pace tier, exactly GPUEngine's algorithm). The series
+    //     recorded is the frame INTERVAL (start to start — what a
+    //     viewer experiences as FPS stability); section 9's
+    //     back-to-back loop is the unpaced control, where the
+    //     interval equals the work time.
+    do {
+        let mem = NovaMemory(totalSize: 128 * 1024 * 1024)
+        let device = NovaGPUDevice()
+        let client = NovaBusClient(memory: mem, device: device)
+        let gov = NovaGovernorDevice()
+        gov.attach(to: mem)
+        gov.supervise(device)
+        device.governor = gov
+        let fbW = 640, fbH = 480
+        let STAGE: UInt64 = 0x40000, DSTAGE: UInt64 = 0x80000
+        let sphere = NovaGPUStandard.icosphere(subdivisions: 5)
+        let torus = NovaGPUStandard.torus(rings: 96, slices: 48)
+        let fb = try client.alloc(UInt64(fbW * fbH * 4))
+        let sh = try client.alloc(8192)
+        try client.uploadData(sh, data: NovaGPUStandard.programBytes(vsLitV4), guestStaging: STAGE)
+        try client.uploadData(sh, off: 4096, data: NovaGPUStandard.programBytes(fsLit), guestStaging: STAGE)
+        try client.setShader(.setVShader, programHandle: sh, off: 0, len: vsLitV4.count * 4)
+        try client.setShader(.setFShader, programHandle: sh, off: 4096, len: fsLit.count * 4)
+        try client.setFBuf(fb, fbW, fbH)
+        try client.setUniform(4, (1, 0, 0, 0))
+        try client.setUniform(5, (0, 1, 0, 0))
+        try client.setUniform(6, (0, 0, 1, 0))
+        try client.setUniform(7, (0, 0, 0, 1))
+        try client.setUniform(8, (0.577, 0.577, 0.577, 0))
+        try client.setUniform(9, (1, 1, 1, 1))
+        let sphereV = try client.alloc(UInt64(sphere.vertices.count * 4))
+        let sphereI = try client.alloc(UInt64(sphere.indices.count * 4))
+        try client.uploadData(sphereV, data: NovaGPUStandard.vertexBytes(sphere), guestStaging: STAGE)
+        try client.uploadData(sphereI, data: NovaGPUStandard.indexBytes(sphere), guestStaging: STAGE)
+        let torusV = try client.alloc(UInt64(torus.vertices.count * 4))
+        let torusI = try client.alloc(UInt64(torus.indices.count * 4))
+        try client.uploadData(torusV, data: NovaGPUStandard.vertexBytes(torus), guestStaging: STAGE)
+        try client.uploadData(torusI, data: NovaGPUStandard.indexBytes(torus), guestStaging: STAGE)
+        try client.governorControl(1)   // enable over the ring, as the app does
+        let proj = NovaGPUStandard.matPerspective(k: 0.45)
+        var intervals: [Double] = []
+        var works: [Double] = []
+        var angle: Float = 0
+        var paceNextStart: Double? = nil   // ms on the NovaGPU.nowMs() clock
+        var lastStart: Double? = nil
+        for _ in 0..<90 {
+            // GPUEngine's pacing: hold the frame start to the
+            // chip's current pace tier; late frames start fresh.
+            let interval = gov.chip.paceTargetMs
+            let now0 = NovaGPU.nowMs()
+            if let next = paceNextStart, now0 < next {
+                Thread.sleep(forTimeInterval: (next - now0) / 1000)
+            }
+            let start = NovaGPU.nowMs()
+            paceNextStart = max(start, paceNextStart ?? start) + interval
+            if let ls = lastStart { intervals.append(start - ls) }
+            lastStart = start
+            angle += 0.02
+            let mvpS = NovaGPUStandard.matMul(proj, NovaGPUStandard.matMul(
+                NovaGPUStandard.matRotX(0.5),
+                NovaGPUStandard.matMul(NovaGPUStandard.matRotY(angle), NovaGPUStandard.matScale(0.72))))
+            let mvpT = NovaGPUStandard.matMul(proj, NovaGPUStandard.matMul(
+                NovaGPUStandard.matTranslate(-0.05, -0.1, 0.35),
+                NovaGPUStandard.matMul(NovaGPUStandard.matRotX(1.1),
+                                       NovaGPUStandard.matMul(NovaGPUStandard.matRotY(angle * 0.6),
+                                                              NovaGPUStandard.matScale(0.62)))))
+            var batch: [(opcode: GPUCommand, fence: UInt64, args: [UInt64])] = []
+            batch.append((opcode: .clear, fence: 0, args: [UInt64(0xFF200810), 0, 0, 0, 0]))
+            for (mvp, vb, ib, idx) in [(mvpS, sphereV, sphereI, sphere.indices.count),
+                                       (mvpT, torusV, torusI, torus.indices.count)] {
+                for r in 0..<4 {
+                    batch.append((opcode: .setUniform, fence: 0,
+                                  args: [UInt64(r), UInt64(mvp[r * 4].bitPattern),
+                                         UInt64(mvp[r * 4 + 1].bitPattern), UInt64(mvp[r * 4 + 2].bitPattern),
+                                         UInt64(mvp[r * 4 + 3].bitPattern)]))
+                }
+                batch.append((opcode: .setVBuf, fence: 0, args: [vb, 0, 0, 0, 0]))
+                batch.append((opcode: .setIBuf, fence: 0, args: [ib, 0, 0, 0, 0]))
+                batch.append((opcode: .draw, fence: 0, args: [UInt64(idx), 0, 0, 0, 0]))
+            }
+            batch.append((opcode: .present, fence: 0, args: [fb, 0, 0, 0, 0]))
+            let t0 = NovaGPU.nowMs()
+            try client.submitBatch(batch)
+            _ = try client.downloadData(fb, len: fbW * fbH * 4, guestStaging: DSTAGE)
+            works.append(NovaGPU.nowMs() - t0)
+        }
+        let iv = Array(intervals.dropFirst(5))
+        let wk = Array(works.dropFirst(5))
+        bench("governor-series frames=\(iv.count) interval_mean_ms=\(ms(mean(iv))) interval_stdev_ms=\(ms(stdev(iv))) " +
+              "p50_ms=\(ms(pct(iv, 0.50))) p95_ms=\(ms(pct(iv, 0.95))) max_ms=\(ms(iv.max() ?? 0)) min_ms=\(ms(iv.min() ?? 0)) " +
+              "work_mean_ms=\(ms(mean(wk))) work_stdev_ms=\(ms(stdev(wk)))")
+        bench("governor-state pace_ms=\(ms(gov.chip.paceTargetMs)) width=\(gov.chip.gpuStageWidth) " +
+              "grain=\(gov.chip.rasterChunkRows) actions=\(gov.chip.actionsIssued) ticks=\(gov.chip.tickCount)")
+        for a in gov.chip.actionLog { bench("governor-action \(a.text)") }
+    }
 } catch {
     print("BENCH FAILED: \(error)")
     exit(1)
