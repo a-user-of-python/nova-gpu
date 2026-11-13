@@ -2,7 +2,7 @@
 
 All numbers are **HOST numbers** from the CI bench job (free
 standard macos-26 runner, Apple Silicon) unless explicitly
-labelled device. The device anchor for this round is Sean's:
+labelled device. The device anchor for this round is the tester's:
 **v5 with the VPU test armed ≈ 35 FPS on his iPad Air M3, with
 the FPS unstable** ("all over the place"); v3 on the same scene
 was ~27 FPS. CI shared-runner variance is large (this baseline
@@ -43,7 +43,7 @@ after warm-up:
 Frame work swings from 16.5 to 36.7 ms around a 23.8 ms median
 **on the host** — stdev is 16% of the mean and p95 − median is
 37% of the median. That spread, in the engine's own loop shape,
-is the measured counterpart of Sean's "fps all over the place":
+is the measured counterpart of the reported "fps all over the place":
 the work itself is unevenly scheduled frame to frame, before
 any display cadence touches it. The governor's thresholds are
 set against this: its jitter trigger (p95 − median > 30% of
@@ -175,7 +175,7 @@ with the fragment executor still the largest stage (the
 FragBatcher flush floor convicted in v5 is untouched by
 this round's scheduling/memory levers). On loaded runners
 the same code reads 19–24 ms — CI runner variance, stated
-plainly. The device anchor remains Sean's: v5 armed ≈ 35
+plainly. The device anchor remains the tester's: v5 armed ≈ 35
 FPS unstable; v6's device verdict is his to give, with the
 governor toggle one tap away from the VPU toggle for an
 on/off A/B.
