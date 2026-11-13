@@ -395,6 +395,46 @@ do {
               "mgvpu_parallel_ms=\(ms(median(parMs))) " +
               "parallel_tri_s=\(ms(Double(tris) / median(parMs) * 1000)) " +
               "first_clip=\(out[0])")
+
+        // Wide issue (v5): the SAME grab + position work, but the
+        // calculator is issued in 256-triangle groups (one call
+        // per group) instead of one 3-lane call per triangle.
+        func wideRange(_ lo: Int, _ hi: Int, _ mPtr: UnsafePointer<Float>) {
+            withUnsafeTemporaryAllocation(of: Float.self, capacity: 256 * 12) { gbuf in
+                gbuf.initialize(repeating: 0)
+                let gPtr = gbuf.baseAddress!
+                var g = lo
+                while g < hi {
+                    let gn = min(256, hi - g)
+                    for k in 0..<gn {
+                        let kk = g + k
+                        GrabUnit.grabTrianglePositions(snapshot: snap, kk * 3, kk * 3 + 1, kk * 3 + 2, into: gPtr + k * 12)
+                    }
+                    VPU.positionWide(positions: gPtr, vertices: gn * 3, matrix: mPtr, into: out + g * 12)
+                    g += gn
+                }
+            }
+        }
+        var wideMs: [Double] = []
+        var wideParMs: [Double] = []
+        for _ in 0..<3 {
+            let t0 = NovaGPU.nowMs()
+            mat.withUnsafeBufferPointer { mp in wideRange(0, tris, mp.baseAddress!) }
+            wideMs.append(NovaGPU.nowMs() - t0)
+            let ranges = MGVPU.subRanges(count: tris)
+            let t1 = NovaGPU.nowMs()
+            mat.withUnsafeBufferPointer { mp in
+                let mPtr = mp.baseAddress!
+                DispatchQueue.concurrentPerform(iterations: ranges.count) { r in
+                    wideRange(ranges[r].0, ranges[r].1, mPtr)
+                }
+            }
+            wideParMs.append(NovaGPU.nowMs() - t1)
+        }
+        bench("vpu-micro-wide tris=\(tris) serial_ms=\(ms(median(wideMs))) " +
+              "serial_tri_s=\(ms(Double(tris) / median(wideMs) * 1000)) " +
+              "mgvpu_parallel_ms=\(ms(median(wideParMs))) " +
+              "parallel_tri_s=\(ms(Double(tris) / median(wideParMs) * 1000))")
     }
 } catch {
     print("BENCH FAILED: \(error)")
