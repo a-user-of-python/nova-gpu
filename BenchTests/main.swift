@@ -19,6 +19,23 @@ func median(_ xs: [Double]) -> Double {
     return s[s.count / 2]
 }
 
+func mean(_ xs: [Double]) -> Double {
+    xs.isEmpty ? 0 : xs.reduce(0, +) / Double(xs.count)
+}
+
+func stdev(_ xs: [Double]) -> Double {
+    if xs.count < 2 { return 0 }
+    let m = mean(xs)
+    return (xs.reduce(0) { $0 + ($1 - m) * ($1 - m) } / Double(xs.count - 1)).squareRoot()
+}
+
+/// Percentile by nearest-rank on the sorted series.
+func pct(_ xs: [Double], _ p: Double) -> Double {
+    if xs.isEmpty { return 0 }
+    let s = xs.sorted()
+    return s[min(s.count - 1, Int(p * Double(s.count)))]
+}
+
 // Sets the lit-shader uniforms directly on the device (same values
 // NovaGPUStandard.setLitUniforms sends over the bus).
 func setLit(_ gpu: NovaGPU, mvp: [Float]) {
@@ -44,9 +61,11 @@ func uploadMesh(_ gpu: NovaGPU, _ m: NovaGPUStandard.Mesh) throws -> (UInt64, UI
 /// Runs the app scene (icosphere 5 + torus, 640x480, lit programs)
 /// for `frames` frames on a fresh device built with the current
 /// NovaGPU.clusterCount; returns per-frame wall + profile medians.
-func appScene(frames: Int, vProg: [UInt32], fProg: [UInt32], vpuTest: Bool = false) throws
+func appScene(frames: Int, vProg: [UInt32], fProg: [UInt32], vpuTest: Bool = false,
+              configure: (NovaGPU) -> Void = { _ in }) throws
     -> (frame: Double, prof: DrawProfile, frags: Double) {
     let gpu = NovaGPU()
+    configure(gpu)
     let fbW = 640, fbH = 480
     let fb = try gpu.alloc(size: UInt64(fbW * fbH * 4))
     gpu.framebuffer = fb; gpu.fbWidth = fbW; gpu.fbHeight = fbH
@@ -435,6 +454,102 @@ do {
               "serial_tri_s=\(ms(Double(tris) / median(wideMs) * 1000)) " +
               "mgvpu_parallel_ms=\(ms(median(wideParMs))) " +
               "parallel_tri_s=\(ms(Double(tris) / median(wideParMs) * 1000))")
+    }
+    // 8. v6 knob sweeps on the app scene: raster grain, stage
+    //    width cap, clip fan-out. The knobs change partitioning
+    //    only — the sweeps exist to put numbers on the governor's
+    //    levers before the governor is allowed to touch them.
+    for rows in [1, 2, 4, 8] {
+        let r = try appScene(frames: 6, vProg: vsLitV4, fProg: fsLit) { g in
+            g.rasterChunkRows = rows
+        }
+        bench("sweep-grain rows=\(rows) frame_ms=\(ms(r.frame)) raster=\(ms(r.prof.rasterMs))")
+    }
+    for w in [0, 3, 6, 12] {
+        let r = try appScene(frames: 6, vProg: vsLitV4, fProg: fsLit) { g in
+            g.stageWidth = w
+        }
+        bench("sweep-width width=\(w) frame_ms=\(ms(r.frame)) raster=\(ms(r.prof.rasterMs))")
+    }
+    for rc in [8, 32] {
+        let r = try appScene(frames: 6, vProg: vsLitV4, fProg: fsLit) { g in
+            g.clipRangeCount = rc
+        }
+        bench("sweep-clipranges ranges=\(rc) frame_ms=\(ms(r.frame)) clip=\(ms(r.prof.clipMs)) bin=\(ms(r.prof.binMs))")
+    }
+
+    // 9. v6 jitter profile: the Live Scene's exact bus shape —
+    //    one submitBatch (clear + 2 draws + present) and one
+    //    1.2 MB download per frame, over the bus client on a
+    //    128 MB guest, 90 frames. This is the series the device
+    //    FPS instability has to be explained against: mean AND
+    //    spread, not just the median the scene reports print.
+    do {
+        let mem = NovaMemory(totalSize: 128 * 1024 * 1024)
+        let device = NovaGPUDevice()
+        let client = NovaBusClient(memory: mem, device: device)
+        let fbW = 640, fbH = 480
+        let STAGE: UInt64 = 0x40000, DSTAGE: UInt64 = 0x80000
+        let sphere = NovaGPUStandard.icosphere(subdivisions: 5)
+        let torus = NovaGPUStandard.torus(rings: 96, slices: 48)
+        let fb = try client.alloc(UInt64(fbW * fbH * 4))
+        let sh = try client.alloc(8192)
+        try client.uploadData(sh, data: NovaGPUStandard.programBytes(vsLitV4), guestStaging: STAGE)
+        try client.uploadData(sh, off: 4096, data: NovaGPUStandard.programBytes(fsLit), guestStaging: STAGE)
+        try client.setShader(.setVShader, programHandle: sh, off: 0, len: vsLitV4.count * 4)
+        try client.setShader(.setFShader, programHandle: sh, off: 4096, len: fsLit.count * 4)
+        try client.setFBuf(fb, fbW, fbH)
+        try client.setUniform(4, (1, 0, 0, 0))
+        try client.setUniform(5, (0, 1, 0, 0))
+        try client.setUniform(6, (0, 0, 1, 0))
+        try client.setUniform(7, (0, 0, 0, 1))
+        try client.setUniform(8, (0.577, 0.577, 0.577, 0))
+        try client.setUniform(9, (1, 1, 1, 1))
+        let sphereV = try client.alloc(UInt64(sphere.vertices.count * 4))
+        let sphereI = try client.alloc(UInt64(sphere.indices.count * 4))
+        try client.uploadData(sphereV, data: NovaGPUStandard.vertexBytes(sphere), guestStaging: STAGE)
+        try client.uploadData(sphereI, data: NovaGPUStandard.indexBytes(sphere), guestStaging: STAGE)
+        let torusV = try client.alloc(UInt64(torus.vertices.count * 4))
+        let torusI = try client.alloc(UInt64(torus.indices.count * 4))
+        try client.uploadData(torusV, data: NovaGPUStandard.vertexBytes(torus), guestStaging: STAGE)
+        try client.uploadData(torusI, data: NovaGPUStandard.indexBytes(torus), guestStaging: STAGE)
+        let proj = NovaGPUStandard.matPerspective(k: 0.45)
+        var series: [Double] = []
+        var angle: Float = 0
+        for _ in 0..<90 {
+            angle += 0.02
+            let mvpS = NovaGPUStandard.matMul(proj, NovaGPUStandard.matMul(
+                NovaGPUStandard.matRotX(0.5),
+                NovaGPUStandard.matMul(NovaGPUStandard.matRotY(angle), NovaGPUStandard.matScale(0.72))))
+            let mvpT = NovaGPUStandard.matMul(proj, NovaGPUStandard.matMul(
+                NovaGPUStandard.matTranslate(-0.05, -0.1, 0.35),
+                NovaGPUStandard.matMul(NovaGPUStandard.matRotX(1.1),
+                                       NovaGPUStandard.matMul(NovaGPUStandard.matRotY(angle * 0.6),
+                                                              NovaGPUStandard.matScale(0.62)))))
+            var batch: [(opcode: GPUCommand, fence: UInt64, args: [UInt64])] = []
+            batch.append((opcode: .clear, fence: 0, args: [UInt64(0xFF200810), 0, 0, 0, 0]))
+            for (mvp, vb, ib, idx) in [(mvpS, sphereV, sphereI, sphere.indices.count),
+                                       (mvpT, torusV, torusI, torus.indices.count)] {
+                for r in 0..<4 {
+                    batch.append((opcode: .setUniform, fence: 0,
+                                  args: [UInt64(r), UInt64(mvp[r * 4].bitPattern),
+                                         UInt64(mvp[r * 4 + 1].bitPattern), UInt64(mvp[r * 4 + 2].bitPattern),
+                                         UInt64(mvp[r * 4 + 3].bitPattern)]))
+                }
+                batch.append((opcode: .setVBuf, fence: 0, args: [vb, 0, 0, 0, 0]))
+                batch.append((opcode: .setIBuf, fence: 0, args: [ib, 0, 0, 0, 0]))
+                batch.append((opcode: .draw, fence: 0, args: [UInt64(idx), 0, 0, 0, 0]))
+            }
+            batch.append((opcode: .present, fence: 0, args: [fb, 0, 0, 0, 0]))
+            let t0 = NovaGPU.nowMs()
+            try client.submitBatch(batch)
+            _ = try client.downloadData(fb, len: fbW * fbH * 4, guestStaging: DSTAGE)
+            series.append(NovaGPU.nowMs() - t0)
+        }
+        let s = Array(series.dropFirst(5))
+        bench("engine-series frames=\(s.count) mean_ms=\(ms(mean(s))) stdev_ms=\(ms(stdev(s))) " +
+              "p50_ms=\(ms(pct(s, 0.50))) p95_ms=\(ms(pct(s, 0.95))) max_ms=\(ms(s.max() ?? 0)) " +
+              "min_ms=\(ms(s.min() ?? 0)) fps_at_mean=\(ms(1000 / max(mean(s), 0.001)))")
     }
 } catch {
     print("BENCH FAILED: \(error)")
