@@ -614,7 +614,7 @@ do {
             let interval = gov.chip.paceTargetMs
             let now0 = NovaGPU.nowMs()
             if let next = paceNextStart, now0 < next {
-                Thread.sleep(forTimeInterval: (next - now0) / 1000)
+                governorWait(untilMs: next)
             }
             let start = NovaGPU.nowMs()
             paceNextStart = max(start, paceNextStart ?? start) + interval
@@ -654,6 +654,11 @@ do {
         bench("governor-series frames=\(iv.count) interval_mean_ms=\(ms(mean(iv))) interval_stdev_ms=\(ms(stdev(iv))) " +
               "p50_ms=\(ms(pct(iv, 0.50))) p95_ms=\(ms(pct(iv, 0.95))) max_ms=\(ms(iv.max() ?? 0)) min_ms=\(ms(iv.min() ?? 0)) " +
               "work_mean_ms=\(ms(mean(wk))) work_stdev_ms=\(ms(stdev(wk)))")
+        // The chip needs its 24-frame window + cooldown to settle;
+        // the tail of the series is the governed steady state.
+        let settled = Array(intervals.dropFirst(45))
+        bench("governor-settled frames=\(settled.count) interval_mean_ms=\(ms(mean(settled))) interval_stdev_ms=\(ms(stdev(settled))) " +
+              "p50_ms=\(ms(pct(settled, 0.50))) p95_ms=\(ms(pct(settled, 0.95))) max_ms=\(ms(settled.max() ?? 0)) min_ms=\(ms(settled.min() ?? 0))")
         bench("governor-state pace_ms=\(ms(gov.chip.paceTargetMs)) width=\(gov.chip.gpuStageWidth) " +
               "grain=\(gov.chip.rasterChunkRows) actions=\(gov.chip.actionsIssued) ticks=\(gov.chip.tickCount)")
         for a in gov.chip.actionLog { bench("governor-action \(a.text)") }
