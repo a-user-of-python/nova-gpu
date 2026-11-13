@@ -2,3 +2,4 @@ build/
 Driver/gpu_driver.bin
 App/NovaGPUTest/gpu_driver.bin
 .DS_Store
+build-artifacts/
