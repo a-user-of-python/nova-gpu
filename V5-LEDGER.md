@@ -45,7 +45,23 @@ in this ledger as a proposed trade and NOT shipped.
   baseline (stage medians + the new splits) in BENCH-v5.md.
 - Status: in progress.
 
-## Attempt 1 — in-scene VPU test (planned)
+## Attempt 1 — in-scene VPU test
+- As planned below: bus command 20 (arm resets the window,
+  disarm stops accumulation), draw() test pass between the
+  vertex and clip stages (MGVPU sub-ranges, per-triangle grab +
+  VPU.position, bit-compare vs the shaded clip, gather overwrites
+  the shaded clips), window + lifetime accumulators, static
+  fault hook (default 0, host tests only), Live Scene toggle +
+  HUD rows, host-test section 11 (armed == unarmed frames on
+  cube + sphere, exact counts, v1-program reference, fault
+  detection + frame change, disarm), bench scene
+  app-scene-vputest + vputest-result line.
+- Expected: all v3 checksums unchanged (correct VPUs make the
+  pass observational); section 11 green; bench shows the armed
+  frame cost and the pass throughput.
+- Status: pushed, awaiting CI.
+
+## Attempt 1 plan (as written before implementation)
 - Device: draw() gains an optional VPU test pass after the vertex
   stage (armed over the bus, command 20): per triangle, grab +
   VPU.position vs the shaded vertex's clip; bit-compare all 4
