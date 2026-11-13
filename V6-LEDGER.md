@@ -130,6 +130,9 @@ verdict is Sean's.
   the full checks (GPU OK + framebuffer match) applied to BOTH.
 - Expected: proof + host tests green; the proof page and CI print
   both wall times and the governor's actions.
+- Status: implemented (one compile fix on the way: NovaCPU.run
+  takes maxSteps as UInt64 — the two slice loops now pass the
+  chip's UInt64 directly); CI pending with attempt 3.
 
 ## Attempt 3 — draw() scratch reuse (allocation churn)
 - draw() allocates and re-initializes its big scratch every call
@@ -143,6 +146,16 @@ verdict is Sean's.
 - Expected: checksums unchanged (scratch contents are fully
   rewritten per draw — depth is re-initialized exactly as now);
   bench A/B on frame mean + series stdev.
+- Implemented as a grow-only ScratchBox set on the device:
+  draw()'s vertex/index snapshots, shaded-vertex buffer, depth
+  buffer, per-warp ops and per-chunk stat arrays, plus the VPU
+  test pass's reference/output/range arrays. Retention off (the
+  governor's shed, or the flag cleared directly) releases all of
+  it at the next draw() entry and that draw allocates exactly as
+  v5. reset() releases it too. plotVectors keeps the v5
+  allocate-per-call behaviour deliberately (the Vectors scene is
+  20 vectors; it is not the frame path under test).
+- Status: implemented; CI pending.
 
 ## Attempt 4 — defaults from evidence + close-out
 - Shipped defaults for grain/width set from the attempt-0 sweeps;
