@@ -413,8 +413,10 @@ do {
 
 // MARK: 9. v4 vector hardware: VPU, plot unit, screen grid
 do {
-    check(NovaGPU.maxScreenVectors == 65536 && NovaGPU.vpuCount == 131072,
-          "vector hardware sizing: MAX_SCREEN_VECTORS 65,536 -> VPU_COUNT 131,072")
+    check(NovaGPU.maxScreenVectors == 65536 && NovaGPU.mgvpuCount == 50
+          && NovaGPU.vpusPerMgvpu == 131072 && NovaGPU.vpuCount == 6553600
+          && MGVPU.totalVPUs == 6553600 && MGVPU.address(ofGlobalID: MGVPU.globalID(mgvpu: 49, vpu: 131071)) == (49, 131071),
+          "vector hardware sizing: 50 MGVPU x 131,072 VPUs = 6,553,600 addressable")
     // 9a. VPU.position is bit-identical to the shader stage's
     // VMAT4 on the same triangle workload (both are ngp_mat4, but
     // prove the VPU's load/axes plumbing preserves it).
@@ -562,6 +564,21 @@ do {
     }
     check(pts == [24 * fbW + 16, 24 * fbW + 112], "plot points mode draws exactly the indexed points",
           "\(pts.count) px")
+
+    // 9e. MGVPU-parallel pass 1 must be frame-identical to serial:
+    // force the parallel path on this small scene and compare the
+    // whole framebuffer byte for byte.
+    try client.clear(0xFF000000)
+    try client.plot(indexCount: idx.count, mode: 0)
+    let serialFrame = try client.downloadData(fb, len: fbW * fbH * 4, guestStaging: DSTAGE)
+    let savedThreshold = NovaGPU.plotParallelThreshold
+    NovaGPU.plotParallelThreshold = 1
+    try client.clear(0xFF000000)
+    try client.plot(indexCount: idx.count, mode: 0)
+    NovaGPU.plotParallelThreshold = savedThreshold
+    let parallelFrame = try client.downloadData(fb, len: fbW * fbH * 4, guestStaging: DSTAGE)
+    check(serialFrame == parallelFrame,
+          "MGVPU-cluster-parallel plot is byte-identical to serial plot")
 } catch {
     check(false, "vector hardware suite", "\(error)")
 }

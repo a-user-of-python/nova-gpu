@@ -18,21 +18,22 @@
 // It fetches 3 vertices (grab unit), runs the 3-axis calculator
 // over the 9 axis values (3 points × X/Y/Z) — the same FP32
 // matrix math (ngp_mat4) the shader stage's VMAT4 executes — and
-// hands the positioned triangle onward. The GPU owns a pool of
-// VPU_COUNT units, sized at 2× the on-screen vector limit for
-// double-capacity headroom (Sean's numbers, 2026-11-13):
+// hands the positioned triangle onward. The VPUs are grouped
+// into MGVPU clusters (Sean's numbers, 2026-11-13):
 //
-//     MAX_SCREEN_VECTORS = 65,536
-//     VPU_COUNT = 2 × MAX_SCREEN_VECTORS = 131,072
+//     MAX_SCREEN_VECTORS = 65,536          (per-frame plot budget)
+//     MGVPU_COUNT = 50                     (clusters)
+//     VPUS_PER_MGVPU = 131,072             (VPUs per cluster)
+//     addressable pool = 50 × 131,072 = 6,553,600 VPUs
 //
-// Both live on NovaGPU (maxScreenVectors / vpuCount) so the
-// counts change in exactly one place. The pool is virtual: a VPU
-// is a stateless datapath (the 48-byte struct below — one
-// workload's registers), demand-allocated on the stack of the
-// host thread running the workload and scheduled onto the host's
-// real threads. There is no array of 131,072 VPU objects and no
-// idle cost; the rated capacity is the addressable limit, and it
-// bounds the plot unit's per-frame vector budget.
+// All four numbers live on NovaGPU so they change in exactly one
+// place. The pool is virtual: a VPU is a stateless datapath (the
+// 48-byte struct below — one workload's registers), demand-
+// allocated on the stack of the host thread running the workload
+// and scheduled by whole MGVPU cluster sub-ranges. There is no
+// array of VPU objects and no idle cost; the capacity is an
+// addressable space, and MAX_SCREEN_VECTORS bounds the plot
+// unit's per-frame vector budget.
 
 /// The grab unit (v4): a vertex-fetch path specialised for pulling
 /// 3D vector attributes out of VRAM. Where the v3 vertex stage
@@ -127,6 +128,40 @@ enum ScreenSpace {
     /// division by the sub-pixel scale).
     @inline(__always)
     static func pixel(_ grid: Int) -> Int { grid >> fracBits }
+}
+
+/// The MGVPU cluster layer (Sean's grouping, 2026-11-13): the
+/// VPU pool is organised as MGVPU_COUNT = 50 clusters of
+/// VPUS_PER_MGVPU = 131,072 VPUs — 6,553,600 addressable VPUs in
+/// total. An MGVPU cluster is the unit of work distribution: a
+/// plot command's vector range is split into one contiguous
+/// sub-range per cluster and the sub-ranges run concurrently
+/// across host threads, which keeps each thread's grab traffic
+/// sequential and local. A VPU address is (mgvpu, vpu); the
+/// global id is mgvpu * VPUS_PER_MGVPU + vpu. Clusters hold no
+/// state of their own — like the VPUs, they are an address space
+/// and a scheduling partition, materialized only as the stack
+/// work slots of the threads running them.
+enum MGVPU {
+    static var count: Int { NovaGPU.mgvpuCount }              // 50
+    static var vpusPerCluster: Int { NovaGPU.vpusPerMgvpu }   // 131,072
+    static var totalVPUs: Int { NovaGPU.vpuCount }            // 6,553,600
+
+    /// Global VPU id for an (mgvpu, vpu) address.
+    static func globalID(mgvpu: Int, vpu: Int) -> Int { mgvpu * vpusPerCluster + vpu }
+    /// The (mgvpu, vpu) address of a global VPU id.
+    static func address(ofGlobalID id: Int) -> (mgvpu: Int, vpu: Int) {
+        (id / vpusPerCluster, id % vpusPerCluster)
+    }
+
+    /// Split `count` workloads into one contiguous sub-range per
+    /// cluster, in order (range k covers
+    /// [count*k/clusters, count*(k+1)/clusters)).
+    static func subRanges(count: Int) -> [(Int, Int)] {
+        let n = Swift.max(count, 0)
+        let c = Swift.max(self.count, 1)
+        return (0..<c).map { k in (n * k / c, n * (k + 1) / c) }
+    }
 }
 
 /// One VPU: positions ONE triangle. Holds the triangle's 9 axis

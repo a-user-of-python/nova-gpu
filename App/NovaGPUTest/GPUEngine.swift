@@ -409,7 +409,7 @@ struct VectorsView: View {
                     .overlay(Text("warming up…").foregroundColor(.white))
             }
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 4) {
-                GridRow { Text("VPU pool"); Text("\(NovaGPU.vpuCount) VPUs (2 × \(NovaGPU.maxScreenVectors) max screen vectors)").bold() }
+                GridRow { Text("VPU pool"); Text("\(NovaGPU.mgvpuCount) MGVPU × \(NovaGPU.vpusPerMgvpu) = \(NovaGPU.vpuCount) VPUs").bold() }
                 GridRow { Text("Vectors per frame"); Text("20 (12 edges + 8 points)").bold() }
                 GridRow { Text("Frame time"); Text(String(format: "%.1f ms", engine.frameMs)).bold() }
                 GridRow { Text("FPS"); Text(String(format: "%.1f", engine.fps)).bold() }

@@ -123,3 +123,20 @@ the judge).
   the plot path enforces the per-frame budget (excess vectors
   dropped). HostTests assert the counts; bench gains a plot
   saturation sweep (1k/8k/32k/65,536 vectors).
+
+## Spec update (Sean, 12:49 + 12:50 ET) — MGVPU clusters
+- VPUs grouped into MGVPU clusters: MGVPU_COUNT = 50,
+  VPUS_PER_MGVPU = 131,072 -> 6,553,600 addressable VPUs
+  (address = (mgvpu, vpu); global id = mgvpu*131072 + vpu).
+  Capacity is an addressable space: slots materialize on demand
+  (48-byte stack work slots); full-occupancy position data
+  (~315 MB) lives in caller vertex buffers in the sparse 2 GiB
+  VRAM, never eagerly allocated.
+- Plot pass 1 now: contiguous sub-range per MGVPU cluster run
+  concurrently (position + DDA), merged in cluster order through
+  the same depth test -> bit-identical to serial (host test 9e
+  forces the parallel path and compares full frames). Threshold
+  NovaGPU.plotParallelThreshold = 2048 vectors.
+- Same-pixel DDA samples coalesced to max z (provably identical
+  framebuffer + final depth; removes ~64x redundant shading on
+  long vectors).

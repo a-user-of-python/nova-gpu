@@ -216,18 +216,32 @@ final class NovaGPU {
     static var computeUnits: Int { clusterCount * lanesPerCluster }   // 1536 at default
     /// v4 vector hardware sizing (Sean, 2026-11-13). MAX_SCREEN_
     /// VECTORS is the plot unit's per-frame on-screen vector
-    /// budget: 65,536. The VPU pool is sized at 2 × that budget
-    /// (double-capacity headroom): VPU_COUNT = 131,072.
+    /// budget: 65,536. The VPUs are grouped into MGVPU clusters —
+    /// MGVPU_COUNT = 50 clusters of VPUS_PER_MGVPU = 131,072 VPUs
+    /// each, an addressable pool of 6,553,600 VPUs. A VPU address
+    /// is (mgvpuIndex, vpuIndex); the global id is
+    /// mgvpuIndex * 131,072 + vpuIndex.
     ///
-    /// The pool is VIRTUAL: a VPU is a stateless 48-byte work slot
-    /// (one triangle's 9 axis values + w), not a persistent object
-    /// — slots are demand-allocated on the stack of whichever host
-    /// thread runs the workload and scheduled onto the host's real
-    /// threads, so the full 131,072-way addressable capacity costs
-    /// zero idle memory and zero scheduling overhead. The triangle
-    /// pipeline never touches the pool.
+    /// The pool is VIRTUAL, and at 6.55M units it has to be: a VPU
+    /// is a stateless 48-byte work slot (one triangle's 9 axis
+    /// values + w), not a persistent object — slots materialize on
+    /// demand on the stack of whichever host thread runs the
+    /// workload, and scheduling distributes whole MGVPU clusters
+    /// (contiguous sub-ranges of a command) across host threads.
+    /// Idle cost is zero: nothing allocates per-VPU state. At
+    /// absolute full occupancy the pool's position data would be
+    /// 6,553,600 × 3 positions × 16 B ≈ 315 MB — but positions
+    /// live in the caller's vertex buffers inside the 2 GiB
+    /// sparse VRAM, committed block-by-block on touch, never
+    /// eagerly. The triangle pipeline never touches the pool.
     static let maxScreenVectors = 65536      // MAX_SCREEN_VECTORS
-    static var vpuCount: Int { 2 * maxScreenVectors }   // VPU_COUNT = 131,072
+    static let mgvpuCount = 50               // MGVPU_COUNT
+    static let vpusPerMgvpu = 131072         // VPUS_PER_MGVPU
+    static var vpuCount: Int { mgvpuCount * vpusPerMgvpu }   // 6,553,600
+    /// Plot pass-1 switches from serial to MGVPU-cluster-parallel
+    /// at this many vectors (internal; host tests lower it to
+    /// force the parallel path on small scenes).
+    static var plotParallelThreshold = 2048
     static let vramSize: UInt64 = 2 * 1024 * 1024 * 1024       // 2 GiB
     static let blockSize = 65536                               // sparse commit granularity
 
@@ -1042,77 +1056,131 @@ final class NovaGPU {
         let chunkCount = (height + chunkRows - 1) / chunkRows
         var chunkPx: [[Int]] = [[Int]](repeating: [], count: chunkCount)
 
-        // Pass 1 (serial, index order = draw order): position,
-        // project, rasterise, depth-test; collect accepted pixels
-        // per row chunk in order.
-        var vpu = VPU()
-        var plotted: UInt64 = 0
-        withUnsafeTemporaryAllocation(of: Float.self, capacity: 16) { mbuf in
-            mbuf.initialize(repeating: 0)
-            for i in 0..<16 { mbuf[i] = u(i) }
-            let mPtr = mbuf.baseAddress!
-            withUnsafeTemporaryAllocation(of: Float.self, capacity: 12) { scratch in
-                scratch.initialize(repeating: 0)
-                let sPtr = scratch.baseAddress!
-                withUnsafeTemporaryAllocation(of: Float.self, capacity: 12) { clipBuf in
-                    clipBuf.initialize(repeating: 0)
-                    let cPtr = clipBuf.baseAddress!
-                    // Per-frame budget: at most MAX_SCREEN_VECTORS
-                    // vectors are plotted (the VPU pool's rated
-                    // on-screen capacity); excess vectors in the
-                    // command are dropped, as a display list that
-                    // overruns its hardware budget would be.
-                    let vectorCount = min(mode == 0 ? idxCount / 2 : idxCount,
-                                          Self.maxScreenVectors)
-                    for v in 0..<vectorCount {
-                        let i0 = Int(ibWords[mode == 0 ? v * 2 : v])
-                        let i1 = mode == 0 ? Int(ibWords[v * 2 + 1]) : i0
-                        guard i0 < vertexCount, i1 < vertexCount else { continue }
-                        GrabUnit.grabTrianglePositions(snapshot: vbFloats, i0, i1, i0, into: sPtr)
-                        vpu.load(positions: sPtr)
-                        vpu.position(matrix: mPtr, into: cPtr)
-                        // Endpoint 0 (and 1 for lines): skip on
-                        // w <= 0 / non-finite, as the clip stage does.
-                        let w0 = cPtr[3]
-                        guard w0 > 0, w0.isFinite else { continue }
-                        let iw0 = 1 / w0
-                        let nx0 = cPtr[0] * iw0, ny0 = cPtr[1] * iw0, nz0 = cPtr[2] * iw0
-                        guard nx0.isFinite, ny0.isFinite, nz0.isFinite else { continue }
-                        let gx0 = ScreenSpace.gridX(nx0, width: width)
-                        let gy0 = ScreenSpace.gridY(ny0, height: height)
-                        if mode == 1 {
-                            let px = ScreenSpace.pixel(gx0), py = ScreenSpace.pixel(gy0)
-                            if px >= 0 && px < width && py >= 0 && py < height {
+        // Per-frame budget: at most MAX_SCREEN_VECTORS vectors are
+        // plotted (the plot unit's rated on-screen capacity);
+        // excess vectors in the command are dropped, as a display
+        // list that overruns its hardware budget would be.
+        let vectorCount = min(mode == 0 ? idxCount / 2 : idxCount,
+                              Self.maxScreenVectors)
+
+        // Pass 1 worker: positions vectors [lo, hi) (grab + VPU),
+        // projects them to the screen grid, DDA-rasterises, and
+        // hands each sample to `emit` as (pixelIndex, z). Consecu-
+        // tive samples landing on the same pixel are coalesced to
+        // their max z first: the DDA steps at 1/64-pixel resolution,
+        // so one pixel can receive ~64 samples per vector, and the
+        // serial walk's outcome for the run is exactly "the max-z
+        // sample tests once" (z is monotonic along a vector) — the
+        // framebuffer and final depth are bit-identical, only
+        // redundant fragment shading is removed.
+        func processRange(_ lo: Int, _ hi: Int, _ emit: (Int, Float) -> Void) -> UInt64 {
+            var count: UInt64 = 0
+            var vpu = VPU()
+            withUnsafeTemporaryAllocation(of: Float.self, capacity: 16) { mbuf in
+                mbuf.initialize(repeating: 0)
+                for i in 0..<16 { mbuf[i] = u(i) }
+                let mPtr = mbuf.baseAddress!
+                withUnsafeTemporaryAllocation(of: Float.self, capacity: 12) { scratch in
+                    scratch.initialize(repeating: 0)
+                    let sPtr = scratch.baseAddress!
+                    withUnsafeTemporaryAllocation(of: Float.self, capacity: 12) { clipBuf in
+                        clipBuf.initialize(repeating: 0)
+                        let cPtr = clipBuf.baseAddress!
+                        for v in lo..<hi {
+                            let i0 = Int(ibWords[mode == 0 ? v * 2 : v])
+                            let i1 = mode == 0 ? Int(ibWords[v * 2 + 1]) : i0
+                            guard i0 < vertexCount, i1 < vertexCount else { continue }
+                            GrabUnit.grabTrianglePositions(snapshot: vbFloats, i0, i1, i0, into: sPtr)
+                            vpu.load(positions: sPtr)
+                            vpu.position(matrix: mPtr, into: cPtr)
+                            // Endpoints: skip on w <= 0 / non-
+                            // finite, as the clip stage does.
+                            let w0 = cPtr[3]
+                            guard w0 > 0, w0.isFinite else { continue }
+                            let iw0 = 1 / w0
+                            let nx0 = cPtr[0] * iw0, ny0 = cPtr[1] * iw0, nz0 = cPtr[2] * iw0
+                            guard nx0.isFinite, ny0.isFinite, nz0.isFinite else { continue }
+                            let gx0 = ScreenSpace.gridX(nx0, width: width)
+                            let gy0 = ScreenSpace.gridY(ny0, height: height)
+                            if mode == 1 {
+                                let px = ScreenSpace.pixel(gx0), py = ScreenSpace.pixel(gy0)
+                                if px >= 0 && px < width && py >= 0 && py < height {
+                                    emit(py * width + px, nz0)
+                                }
+                                count += 1
+                                continue
+                            }
+                            let w1 = cPtr[7]
+                            guard w1 > 0, w1.isFinite else { continue }
+                            let iw1 = 1 / w1
+                            let nx1 = cPtr[4] * iw1, ny1 = cPtr[5] * iw1, nz1 = cPtr[6] * iw1
+                            guard nx1.isFinite, ny1.isFinite, nz1.isFinite else { continue }
+                            let gx1 = ScreenSpace.gridX(nx1, width: width)
+                            let gy1 = ScreenSpace.gridY(ny1, height: height)
+                            count += 1
+                            var runDi = -1
+                            var runZ: Float = 0
+                            PlotUnit.rasterizeLine(x0: gx0, y0: gy0, x1: gx1, y1: gy1) { gx, gy, s, steps in
+                                let px = ScreenSpace.pixel(gx), py = ScreenSpace.pixel(gy)
+                                guard px >= 0 && px < width && py >= 0 && py < height else {
+                                    if runDi >= 0 { emit(runDi, runZ); runDi = -1 }
+                                    return
+                                }
+                                let z = steps == 0 ? nz0 : nz0 + (nz1 - nz0) * (Float(s) / Float(steps))
                                 let di = py * width + px
-                                if nz0 >= 0 && nz0 >= depthPtr[di] {
-                                    depthPtr[di] = nz0
-                                    chunkPx[py / chunkRows].append(di)
+                                if di == runDi {
+                                    if z > runZ { runZ = z }
+                                } else {
+                                    if runDi >= 0 { emit(runDi, runZ) }
+                                    runDi = di; runZ = z
                                 }
                             }
-                            plotted += 1
-                            continue
-                        }
-                        let w1 = cPtr[7]
-                        guard w1 > 0, w1.isFinite else { continue }
-                        let iw1 = 1 / w1
-                        let nx1 = cPtr[4] * iw1, ny1 = cPtr[5] * iw1, nz1 = cPtr[6] * iw1
-                        guard nx1.isFinite, ny1.isFinite, nz1.isFinite else { continue }
-                        let gx1 = ScreenSpace.gridX(nx1, width: width)
-                        let gy1 = ScreenSpace.gridY(ny1, height: height)
-                        plotted += 1
-                        PlotUnit.rasterizeLine(x0: gx0, y0: gy0, x1: gx1, y1: gy1) { gx, gy, s, steps in
-                            let px = ScreenSpace.pixel(gx), py = ScreenSpace.pixel(gy)
-                            guard px >= 0 && px < width && py >= 0 && py < height else { return }
-                            let z = steps == 0 ? nz0 : nz0 + (nz1 - nz0) * (Float(s) / Float(steps))
-                            let di = py * width + px
-                            if z >= 0 && z >= depthPtr[di] {
-                                depthPtr[di] = z
-                                chunkPx[py / chunkRows].append(di)
-                            }
+                            if runDi >= 0 { emit(runDi, runZ) }
                         }
                     }
                 }
             }
+            return count
+        }
+
+        // Depth-testing emit, shared by the serial path and the
+        // parallel path's merge: the triangle rule (z >= 0 and
+        // z >= depth wins), samples in vector order.
+        let depthEmit: (Int, Float) -> Void = { di, z in
+            if z >= 0 && z >= depthPtr[di] {
+                depthPtr[di] = z
+                chunkPx[(di / width) / chunkRows].append(di)
+            }
+        }
+
+        // Pass 1: below the threshold, run serially in index order.
+        // At scale, distribute contiguous vector sub-ranges across
+        // the MGVPU clusters (the scheduling layer: one sub-range
+        // per cluster, run concurrently, each cluster collecting
+        // its own sample list), then merge the lists in cluster
+        // order through the same depth test — the merged order is
+        // exactly the serial order, so the frame is bit-identical
+        // either way (host-tested).
+        var plotted: UInt64 = 0
+        if vectorCount >= Self.plotParallelThreshold {
+            let ranges = MGVPU.subRanges(count: vectorCount)
+            final class SampleBox { var samples: [(Int, Float)] = [] }
+            let boxes = ranges.map { _ in SampleBox() }
+            let counts = UnsafeMutablePointer<UInt64>.allocate(capacity: ranges.count)
+            counts.initialize(repeating: 0, count: ranges.count)
+            defer { counts.deinitialize(count: ranges.count); counts.deallocate() }
+            DispatchQueue.concurrentPerform(iterations: ranges.count) { k in
+                let box = boxes[k]
+                counts[k] = processRange(ranges[k].0, ranges[k].1) { di, z in
+                    box.samples.append((di, z))
+                }
+            }
+            for k in 0..<ranges.count {
+                plotted += counts[k]
+                for (di, z) in boxes[k].samples { depthEmit(di, z) }
+            }
+        } else {
+            plotted = processRange(0, vectorCount, depthEmit)
         }
         stats.vectorsPlotted += plotted
 
