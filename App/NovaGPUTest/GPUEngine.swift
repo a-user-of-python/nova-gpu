@@ -35,6 +35,29 @@ final class GPUEngine: ObservableObject {
         queue.async { self.vpuWanted = on }
     }
 
+    // v6 governor HUD state (written from the frame loop below).
+    @Published var govOn = false
+    @Published var govPaceMs: Double = 0
+    @Published var govMedianMs: Double = 0
+    @Published var govP95Ms: Double = 0
+    @Published var govJitterMs: Double = 0
+    @Published var govWidth = 0
+    @Published var govGrain = 0
+    @Published var govLastAction = ""
+    private var govWanted = false   // queue-confined
+    private var govSent = false     // queue-confined: state last sent over the ring
+    private var governor: NovaGovernorDevice?
+    private var paceNextStart: Date?
+
+    /// The governor toggle: enable/disable travel over the bus
+    /// (ring opcode 21) at the top of the next frame batch, and
+    /// while enabled the frame loop holds frame starts to the
+    /// chip's pace tier. The chip ticks itself on every PRESENT.
+    func setGovernor(_ on: Bool) {
+        DispatchQueue.main.async { self.govOn = on }
+        queue.async { self.govWanted = on }
+    }
+
     private let fbW = 640, fbH = 480
     private let mem = NovaMemory(totalSize: 128 * 1024 * 1024)
     private let device = NovaGPUDevice()
@@ -60,6 +83,15 @@ final class GPUEngine: ObservableObject {
     private func setup() {
         do {
             client = NovaBusClient(memory: mem, device: device)
+            // v6: the supervisor chip is attached from boot. Its
+            // telemetry window fills on every PRESENT whether or
+            // not it is enabled; it only ACTS (issues commands)
+            // once the toggle enables it over the ring.
+            let gov = NovaGovernorDevice()
+            gov.attach(to: mem)
+            gov.supervise(device)
+            device.governor = gov
+            governor = gov
             let sphere = NovaGPUStandard.icosphere(subdivisions: 5)
             let torus = NovaGPUStandard.torus(rings: 96, slices: 48)
             sphereIdx = sphere.indices.count
@@ -112,6 +144,23 @@ final class GPUEngine: ObservableObject {
 
     private func renderFrame() {
         guard ready else { return }
+        // v6 governor pacing: while the chip is enabled, frame
+        // starts are held to the chip's pace tier — a steady
+        // cadence instead of the raw 16 ms timer firing whenever.
+        // A frame that overruns its slot starts the next slot from
+        // now (no catch-up debt). The sleep is before t0, so
+        // frameMs below still measures work, not pacing.
+        if govWanted, let gov = governor {
+            let interval = gov.chip.paceTargetMs / 1000
+            let tickNow = Date()
+            if let next = paceNextStart, tickNow < next {
+                Thread.sleep(forTimeInterval: next.timeIntervalSince(tickNow))
+            }
+            let start = Date()
+            paceNextStart = max(start, paceNextStart ?? start).addingTimeInterval(interval)
+        } else {
+            paceNextStart = nil
+        }
         let t0 = Date()
         do {
             angle += 0.02
@@ -130,6 +179,13 @@ final class GPUEngine: ObservableObject {
             // status poll) for each of its ~15 frame commands, on
             // top of the six per-object uniform resends now avoided.
             var batch: [(opcode: GPUCommand, fence: UInt64, args: [UInt64])] = []
+            // v6 governor: enable/disable travel over the ring
+            // (opcode 21) on the frame after the toggle changes.
+            if govWanted != govSent {
+                batch.append((opcode: .governorCmd, fence: 0,
+                              args: [govWanted ? 1 : 2, 0, 0, 0, 0]))
+                govSent = govWanted
+            }
             // v5 VPU test: arm at the top of the batch while the
             // toggle is on (each arm resets the result window, so
             // the HUD numbers below cover exactly this frame's two
@@ -179,6 +235,7 @@ final class GPUEngine: ObservableObject {
             let stats = device.gpu.stats
             let vt = device.gpu.vpuTest
             let vtArmed = vpuArmed
+            let chip = governor?.chip
             DispatchQueue.main.async {
                 self.frame = img
                 self.frameMs = ms
@@ -192,6 +249,15 @@ final class GPUEngine: ObservableObject {
                     self.vpuTriPerSec = vt.trianglesPerSecond
                     self.vpuClusters = vt.clustersEngaged
                     self.vpuPassMs = vt.passMs
+                }
+                if let chip = chip {
+                    self.govPaceMs = chip.paceTargetMs
+                    self.govMedianMs = chip.windowMedianMs
+                    self.govP95Ms = chip.windowP95Ms
+                    self.govJitterMs = chip.jitterMs
+                    self.govWidth = chip.gpuStageWidth
+                    self.govGrain = chip.rasterChunkRows
+                    self.govLastAction = chip.actionLog.last?.text ?? ""
                 }
             }
         } catch {
@@ -260,6 +326,10 @@ struct LiveSceneView: View {
                 get: { engine.vpuTestOn },
                 set: { engine.setVPUTest($0) }))
                 .font(.system(.body, design: .monospaced))
+            Toggle("\(NovaGovernor.chipName) — supervisor chip (pace + stabilize)", isOn: Binding(
+                get: { engine.govOn },
+                set: { engine.setGovernor($0) }))
+                .font(.system(.body, design: .monospaced))
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 4) {
                 GridRow { Text("Compute units active"); Text("\(engine.cusActive) / \(NovaGPU.computeUnits)").bold() }
                 GridRow { Text("Triangles per frame"); Text("\(engine.triangles)").bold() }
@@ -280,7 +350,17 @@ struct LiveSceneView: View {
                     GridRow { Text("MGVPU clusters engaged"); Text("\(engine.vpuClusters) / \(NovaGPU.mgvpuCount)").bold() }
                     GridRow { Text("VPU pass time"); Text(String(format: "%.2f ms", engine.vpuPassMs)).bold() }
                 }
+                if engine.govOn {
+                    GridRow { Text("Governor pace target"); Text(String(format: "%.1f ms", engine.govPaceMs)).bold() }
+                    GridRow { Text("Frame interval p50 / p95"); Text(String(format: "%.1f / %.1f ms", engine.govMedianMs, engine.govP95Ms)).bold() }
+                    GridRow { Text("Frame jitter (p95 − p50)"); Text(String(format: "%.1f ms", engine.govJitterMs)).bold() }
+                    GridRow { Text("GPU width / raster grain"); Text(engine.govWidth == 0 ? "uncapped / \(engine.govGrain)" : "\(engine.govWidth) / \(engine.govGrain)").bold() }
+                }
             }.font(.system(.body, design: .monospaced))
+            if engine.govOn && !engine.govLastAction.isEmpty {
+                Text("Governor: \(engine.govLastAction)")
+                    .font(.footnote).foregroundColor(.secondary)
+            }
             Text(engine.statusLine).font(.footnote).foregroundColor(.secondary)
             Spacer()
         }
