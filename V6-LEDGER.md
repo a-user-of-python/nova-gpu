@@ -172,5 +172,18 @@ verdict is Sean's.
 - Final CI, IPA binary verified to contain the governor paths,
   README v6 section (the chip in plain language), BENCH-v6.md,
   this ledger completed, NOVA tracking entry.
-- Status: in progress (governorWait pacer + slice cap are the
-  last code changes; this attempt's CI run is the final gate).
+- Measured: final CI run 43515631697, ALL JOBS SUCCESS on the
+  tip tree. governorWait re-measurement (same run): unpaced
+  interval stdev 5.19 ms → governed 3.88 ms; governed median
+  interval exactly 20.800 ms = the tier the chip selected;
+  max 39.3 → 34.3 ms. Proof: fixed 0.03 s vs supervised
+  0.04 s, full battery green on both. Host tests: 76 PASS,
+  0 FAIL — every pre-v6 checksum intact.
+- IPA: NovaGPU-Test-v6.ipa, 255,052 bytes, md5
+  51148a234d87f5bd2738b68c0b64fa39, bundle
+  com.user.novagputest. Shipped binary strings-verified to
+  contain the v6 paths (NovaGovernor, SET_PACE_TIER /
+  SET_RASTER_GRAIN / SET_CPU_SLICE, governorWait symbol, the
+  supervisor toggle label).
+- Status: DONE. Device verdict owed from Sean (test steps in
+  the delivery note).
