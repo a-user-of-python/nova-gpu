@@ -589,6 +589,21 @@ do {
     let parallelFrame = try client.downloadData(fb, len: fbW * fbH * 4, guestStaging: DSTAGE)
     check(serialFrame == parallelFrame,
           "MGVPU-cluster-parallel plot is byte-identical to serial plot")
+
+    // 9f. v5 wide issue: the plotted frame must not depend on the
+    // pass-1 batch size (endpoints are positioned in batches
+    // through the shared calculator). serialFrame above was
+    // produced at the default batch size; re-plot at 1, 7 and
+    // 1024 and compare byte for byte.
+    let savedBatch = NovaGPU.plotBatchSize
+    for bs in [1, 7, 1024] {
+        NovaGPU.plotBatchSize = bs
+        try client.clear(0xFF000000)
+        try client.plot(indexCount: idx.count, mode: 0)
+        let f = try client.downloadData(fb, len: fbW * fbH * 4, guestStaging: DSTAGE)
+        check(f == serialFrame, "plot frame is batch-size invariant (batch = \(bs))")
+    }
+    NovaGPU.plotBatchSize = savedBatch
 } catch {
     check(false, "vector hardware suite", "\(error)")
 }
@@ -721,6 +736,37 @@ do {
           "disarmed draws leave the VPU test window untouched")
 } catch {
     check(false, "VPU test suite", "\(error)")
+}
+
+// MARK: 12. v5 wide VPU issue: grouped positioning == per-triangle VPU, bitwise
+do {
+    var rng: UInt64 = 0xB17C4
+    func frand() -> Float {
+        rng = rng &* 6364136223846793005 &+ 1442695040888963407
+        return Float((rng >> 40) & 0xFFFFFF) / Float(0x1000000) * 4 - 2
+    }
+    let mat: [Float] = [0.8, 0.1, -0.3, 0.5, -0.2, 1.1, 0.4, -0.6,
+                        0.9, -0.7, 0.3, 0.25, -0.1, 0.2, 0.45, 1.0]
+    var wideOK = true
+    for group in [1, 2, 3, 4, 5, 17, 64, 250] {
+        let n = group * 12
+        let pos = UnsafeMutablePointer<Float>.allocate(capacity: n)
+        let outA = UnsafeMutablePointer<Float>.allocate(capacity: n)
+        let outB = UnsafeMutablePointer<Float>.allocate(capacity: n)
+        defer { pos.deallocate(); outA.deallocate(); outB.deallocate() }
+        for i in 0..<n { pos[i] = frand() }
+        var vpu = VPU()
+        mat.withUnsafeBufferPointer { mp in
+            for k in 0..<group {
+                vpu.load(positions: pos + k * 12)
+                vpu.position(matrix: mp.baseAddress!, into: outA + k * 12)
+            }
+            VPU.positionWide(positions: pos, vertices: group * 3,
+                             matrix: mp.baseAddress!, into: outB)
+        }
+        for i in 0..<n where outA[i].bitPattern != outB[i].bitPattern { wideOK = false }
+    }
+    check(wideOK, "VPU.positionWide is bit-identical to per-triangle VPU.position (groups 1..250 triangles)")
 }
 
 print(failures == 0 ? "\nALL HOST TESTS PASSED" : "\n\(failures) HOST TEST(S) FAILED")
