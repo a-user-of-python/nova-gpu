@@ -292,6 +292,12 @@ func ngp_cross_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, 
 func ngp_vnorm_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ lanes: Int32)
 @_silgen_name("ngp_mat4_f32")
 func ngp_mat4_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ u: UnsafePointer<Float>, _ lanes: Int32)
+@_silgen_name("ngp_flush_writeback")
+func ngp_flush_writeback(_ col: UnsafePointer<Float>, _ px: UnsafePointer<Int>,
+                         _ count: Int32,
+                         _ table: UnsafePointer<UnsafeMutablePointer<UInt8>?>,
+                         _ tableCount: Int32, _ fb: UInt64, _ firstBlock: Int32,
+                         _ skip: UnsafeMutablePointer<Int32>) -> Int32
 @_silgen_name("ngp_f2i_u32")
 func ngp_f2i_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<Float>, _ n: Int32)
 @_silgen_name("ngp_i2f_f32")
