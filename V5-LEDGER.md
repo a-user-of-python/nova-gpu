@@ -59,7 +59,20 @@ in this ledger as a proposed trade and NOT shipped.
 - Expected: all v3 checksums unchanged (correct VPUs make the
   pass observational); section 11 green; bench shows the armed
   frame cost and the pass throughput.
-- Status: pushed, awaiting CI.
+- CI run 43482002661: bench SUCCESS (armed frame 26.11 ms vs
+  24.44 unarmed, pass 12.2M tri/s, 0 mismatches over 237,568
+  triangles); host tests 1 FAILURE — the fault check expected
+  12 mismatched corners, got 6. Root cause is in the TEST PASS,
+  found by its own fault hook: the compare read the reference
+  from the shaded vertex itself, so once a triangle's gather
+  overwrote a shared vertex, the next triangle touching it
+  compared VPU-vs-VPU and the fault was masked (one mismatch
+  per cube face instead of per triangle). Fix: the pass now
+  snapshots the shader clips into a pristine reference buffer
+  before positioning, and every corner compares against it —
+  the test is strictly stronger (and the honest design: a
+  reference the gather cannot contaminate).
+- Status: fix pushed, awaiting CI.
 
 ## Attempt 1 plan (as written before implementation)
 - Device: draw() gains an optional VPU test pass after the vertex
