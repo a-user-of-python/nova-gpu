@@ -94,6 +94,39 @@ struct PlotProfile {
     var totalMs: Double = 0
 }
 
+/// Accumulators for the v5 in-draw VPU test (see NovaGPU.armVPUTest
+/// and the test pass inside draw()). A mismatch is a triangle
+/// corner whose VPU clip position differs in ANY component's bit
+/// pattern from the shader stage's clip position for the same
+/// vertex. maxAbsError is the largest finite |VPU - shader|
+/// component difference seen — informational only; the verdict is
+/// the mismatch count, so even a +0/-0 bit difference (abs error
+/// exactly 0) still counts as a mismatch and is never rounded
+/// into a pass.
+struct VPUTestResult {
+    var trianglesTested = 0
+    var cornersCompared = 0
+    var mismatches = 0
+    var maxAbsError: Float = 0
+    var passMs: Double = 0
+    var clustersEngaged = 0
+    /// One VPU workload is issued per triangle tested.
+    var vpusEngaged: Int { trianglesTested }
+    /// VPU positioning throughput over the accumulated window.
+    var trianglesPerSecond: Double {
+        passMs > 0 ? Double(trianglesTested) / (passMs / 1000) : 0
+    }
+    mutating func record(triangles: Int, mismatches: Int, maxErr: Float,
+                         passMs: Double, clusters: Int) {
+        trianglesTested += triangles
+        cornersCompared += triangles * 3
+        self.mismatches += mismatches
+        if maxErr > maxAbsError { maxAbsError = maxErr }
+        self.passMs += passMs
+        clustersEngaged = clusters
+    }
+}
+
 struct GPUStats {
     var laneOps: UInt64 = 0                 // total lane-instructions executed
     var warpsIssued: UInt64 = 0
@@ -458,6 +491,9 @@ final class NovaGPU {
         allocations.removeAll()
         vramReserved = 0
         stats.reset()
+        vpuTestEnabled = false
+        vpuTest = VPUTestResult()
+        vpuTestLifetime = VPUTestResult()
         textures = [:]
     }
 
@@ -478,6 +514,28 @@ final class NovaGPU {
     private(set) var lastDrawProfile = DrawProfile()
     /// Pass timings of the most recent plotVectors call (v5 profiling).
     private(set) var lastPlotProfile = PlotProfile()
+    /// v5 in-scene VPU test state (armed over the bus, command 20).
+    /// `vpuTest` accumulates over the current window — arming
+    /// resets it, so the app arms at the top of each frame and
+    /// reads per-frame numbers; `vpuTestLifetime` accumulates
+    /// since the last device reset.
+    private(set) var vpuTest = VPUTestResult()
+    private(set) var vpuTestLifetime = VPUTestResult()
+    private(set) var vpuTestEnabled = false
+    /// Host-test fault injection for the VPU test pass: when
+    /// nonzero, this value is added to corner 0's clip x inside
+    /// the pass (before the compare AND the gather), proving the
+    /// test detects a wrong VPU and that armed frames really are
+    /// rendered from VPU positions. Never set by the app; the
+    /// default 0 is the honest path.
+    static var vpuTestFault: Float = 0
+
+    /// Arms/disarms the in-draw VPU test. Arming resets the
+    /// window accumulator.
+    func armVPUTest(_ on: Bool) {
+        vpuTestEnabled = on
+        if on { vpuTest = VPUTestResult() }
+    }
     static func nowMs() -> Double { ProcessInfo.processInfo.systemUptime * 1000 }
     /// When true, FragBatcher.flush() accumulates its wall time into
     /// DrawProfile.fragExecMs (two clock reads per warp flush — a
@@ -848,6 +906,22 @@ final class NovaGPU {
         }
         prof.vertexMs = Self.nowMs() - pV0
         stats.trianglesIn += UInt64(idxCount / 3)
+        let triCount = (idxCount - 3) / 3 + 1   // idxCount >= 3 (guarded above)
+
+        // ---- v5 VPU test pass (only when armed over the bus):
+        // every triangle is re-positioned through the actual VPU
+        // path and bit-compared against the clip positions the
+        // vertex stage just produced; the shaded clips are then
+        // overwritten with the VPU clips, so an armed frame is
+        // RENDERED FROM the VPU positions — a wrong VPU visibly
+        // breaks the picture. With correct VPUs the pass is
+        // observational only (the host tests prove armed and
+        // unarmed frames byte-identical). Its wall time lands in
+        // neither stage timer; it is reported in vpuTest.passMs.
+        if vpuTestEnabled {
+            runVPUTestPass(triCount: triCount, snapshot: vbF, indices: ibWords,
+                           uniforms: unis, shaded: shadedPtr)
+        }
 
         // ---- Clip + fan-triangulate once, into a work list with
         // precomputed screen coordinates, then bin each triangle into
@@ -868,7 +942,6 @@ final class NovaGPU {
         // serial list: triangle order, and therefore depth-tie
         // behaviour, is unchanged.
         let pC0 = Self.nowMs()
-        let triCount = idxCount >= 3 ? (idxCount - 3) / 3 + 1 : 0
         final class WorkBox { var tris: [WorkTri] = [] }
         let rangeCount = min(32, max(triCount, 1))
         let boxes = (0..<rangeCount).map { _ in WorkBox() }
@@ -1007,6 +1080,88 @@ final class NovaGPU {
         prof.totalMs = ms
         lastDrawProfile = prof
         return ms
+    }
+
+    /// The v5 VPU test pass, run inside draw() between the vertex
+    /// and clip stages while armed. For every triangle: the grab
+    /// unit fetches its 3 vertex positions from the draw's
+    /// snapshot, ONE VPU runs the 3-axis calculator (ngp_mat4 over
+    /// uniforms c0..c3 — the same matrix the vertex stage's VMAT4
+    /// consumed) over the triangle's 9 axis values, and the
+    /// resulting clip position of each corner is bit-compared
+    /// against the clip the shader stage produced for the same
+    /// vertex (the independently computed reference). Workloads
+    /// are split into contiguous sub-ranges over the MGVPU
+    /// clusters and run concurrently. After the compare, each
+    /// shaded vertex's clip is OVERWRITTEN with the VPU's clip
+    /// (the gather), so the frame that renders is positioned by
+    /// the VPUs. Results accumulate into `vpuTest` (window) and
+    /// `vpuTestLifetime`.
+    private func runVPUTestPass(triCount: Int,
+                                snapshot vbF: UnsafePointer<Float>,
+                                indices ibWords: UnsafePointer<UInt32>,
+                                uniforms unis: [Float],
+                                shaded shadedPtr: UnsafeMutablePointer<ShadedVertex>) {
+        let t0 = Self.nowMs()
+        let out = UnsafeMutablePointer<Float>.allocate(capacity: triCount * 12)
+        defer { out.deallocate() }
+        let ranges = MGVPU.subRanges(count: triCount)
+        var clusters = 0
+        for r in ranges where r.1 > r.0 { clusters += 1 }
+        unis.withUnsafeBufferPointer { ub in
+            let mPtr = ub.baseAddress!
+            DispatchQueue.concurrentPerform(iterations: ranges.count) { r in
+                let lo = ranges[r].0, hi = ranges[r].1
+                if lo >= hi { return }
+                var vpu = VPU()
+                withUnsafeTemporaryAllocation(of: Float.self, capacity: 12) { s in
+                    s.initialize(repeating: 0)
+                    let sPtr = s.baseAddress!
+                    for k in lo..<hi {
+                        let t = k * 3
+                        GrabUnit.grabTrianglePositions(
+                            snapshot: vbF,
+                            Int(ibWords[t]), Int(ibWords[t + 1]), Int(ibWords[t + 2]),
+                            into: sPtr)
+                        vpu.load(positions: sPtr)
+                        vpu.position(matrix: mPtr, into: out + k * 12)
+                    }
+                }
+            }
+        }
+        // Compare + gather (serial, in triangle order): the
+        // reference is the shader stage's clip for the corner's
+        // vertex; the gather writes the VPU clip over it.
+        let fault = Self.vpuTestFault
+        var mismatches = 0
+        var maxErr: Float = 0
+        for k in 0..<triCount {
+            let t = k * 3
+            for c in 0..<3 {
+                let vi = Int(ibWords[t + c])
+                let o = k * 12 + c * 4
+                var g0 = out[o]
+                let g1 = out[o + 1], g2 = out[o + 2], g3 = out[o + 3]
+                if fault != 0 && c == 0 { g0 += fault }   // host-test fault hook
+                let ref = shadedPtr[vi].clip
+                if g0.bitPattern != ref.0.bitPattern || g1.bitPattern != ref.1.bitPattern
+                    || g2.bitPattern != ref.2.bitPattern || g3.bitPattern != ref.3.bitPattern {
+                    mismatches += 1
+                }
+                let d0 = abs(g0 - ref.0), d1 = abs(g1 - ref.1)
+                let d2 = abs(g2 - ref.2), d3 = abs(g3 - ref.3)
+                if d0.isFinite && d0 > maxErr { maxErr = d0 }
+                if d1.isFinite && d1 > maxErr { maxErr = d1 }
+                if d2.isFinite && d2 > maxErr { maxErr = d2 }
+                if d3.isFinite && d3 > maxErr { maxErr = d3 }
+                shadedPtr[vi].clip = (g0, g1, g2, g3)
+            }
+        }
+        let dt = Self.nowMs() - t0
+        vpuTest.record(triangles: triCount, mismatches: mismatches,
+                       maxErr: maxErr, passMs: dt, clusters: clusters)
+        vpuTestLifetime.record(triangles: triCount, mismatches: mismatches,
+                               maxErr: maxErr, passMs: dt, clusters: clusters)
     }
 
     /// v4 plot unit: plots 3D vectors from the current vertex and
