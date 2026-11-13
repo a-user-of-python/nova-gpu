@@ -104,6 +104,66 @@ later (the bus is the compatibility contract for that merge).
   device verdict is Sean's. Full record: `BENCH-v5.md`,
   attempts in `V5-LEDGER.md`.
 
+## v6 — the supervisor chip (NovaGovernor) + stabilisation
+
+- **A new chip whose only job is to look after the CPU and
+  the GPU.** Working name **NovaGovernor** — the name lives in
+  exactly one place in the code (`NovaGovernor.chipName`) so
+  it can be renamed with a single edit. It is a real device on
+  the bus, not app glue: its own MMIO register block
+  (0x…0180–0x…0200, beside the GPU's, device ID "NGOV") that
+  the NovaCPU can read and tick like any other hardware, plus
+  GPU ring command 21 for enable / disable / tick from a host.
+- **What it senses:** every frame boundary (it ticks itself on
+  every PRESENT) — frame interval and its rolling median /
+  p95 / jitter, bus descriptors serviced, VRAM committed vs
+  reserved — and, from the CPU's host loop, each run slice's
+  wall time.
+- **What it does about it — special commands, all real:**
+  `SET_PACE_TIER` (the frame-pacing target the host schedules
+  against: 16.7 / 20.8 / 25 / 33.3 / 50 ms), `SET_RASTER_GRAIN`
+  (rows per raster chunk), `SET_GPU_WIDTH` (how much of the
+  host the GPU stages may occupy at once), `SET_CPU_SLICE`
+  (how long the NovaCPU runs between GPU service points),
+  `SET_SCRATCH_RETENTION` (whether the GPU keeps its big draw
+  buffers between frames or frees them). Every command goes
+  through one issue path, lands on a real knob, and is written
+  to an action log with the numbers that caused it ("frame
+  jitter 7.8 ms is over 30% of the 17.6 ms median"). Turning
+  the chip off restores the exact v5 operating point through
+  the same path. The policy is a few dozen lines of named
+  thresholds with hysteresis (asymmetric streaks + a cooldown)
+  — no learning, nothing hidden. It never drops work and never
+  changes a pixel: the framebuffer checksums police that, and
+  host tests prove frames byte-identical with the knobs
+  twisted and with the chip live.
+- **Frame pacing, measured honestly:** the first pacer slept
+  until each frame deadline — and the bench convicted it
+  (sleep overshoot *added* variance on the host). The shipped
+  pacer sleeps only to the last ~1 ms and spins the remainder.
+  Same-run host A/B after the fix: interval stdev 5.19 →
+  3.88 ms, and the governed median interval landed on exactly
+  20.800 ms — the tier the chip itself had picked. Pacing pads
+  short frames up to the tier; a frame whose work exceeds the
+  tier stays long, and the log says so.
+- **Retained draw scratch:** draw()'s big buffers (snapshots,
+  shaded vertices, the 1.2 MB depth buffer, stage statistics)
+  are kept between draws in a grow-only cache — several MB of
+  allocator churn leaves the frame. Same-run host A/B: ~0.2 ms
+  per frame on a healthy runner, direction-consistent across
+  stages; the governor's scratch command is what frees it
+  under VRAM pressure.
+- **In the app:** a toggle next to the VPU test toggle (one
+  tap A/B), HUD rows for pace target, frame-interval p50/p95,
+  jitter, GPU width/grain, and the chip's last action in plain
+  words. The CPU Proof page runs its slices under the chip and
+  prints its action log; CI runs the proof twice (fixed v5
+  slices vs supervised) with the full checksum battery on both.
+- All figures are HOST (CI runner) numbers; the device anchor
+  is ~35 FPS unstable for v5 with the VPU test armed, and the
+  v6 device verdict is the tester's. Full record:
+  `BENCH-v6.md`, attempts in `V6-LEDGER.md`.
+
 ## Layout
 
 - `Sources/NovaGPU/` — the GPU core (shader ISA + executor, the GPU,
