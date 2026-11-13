@@ -477,6 +477,14 @@ do {
         }
         bench("sweep-clipranges ranges=\(rc) frame_ms=\(ms(r.frame)) clip=\(ms(r.prof.clipMs)) bin=\(ms(r.prof.binMs))")
     }
+    // v6 attempt 3 A/B: retained draw scratch on (v6) vs off
+    // (v5 allocate-per-draw), same scene, same run.
+    for retain in [true, false] {
+        let r = try appScene(frames: 6, vProg: vsLitV4, fProg: fsLit) { g in
+            g.scratchRetentionEnabled = retain
+        }
+        bench("sweep-scratch retain=\(retain) frame_ms=\(ms(r.frame)) snapshot=\(ms(r.prof.snapshotMs)) raster=\(ms(r.prof.rasterMs))")
+    }
 
     // 9. v6 jitter profile: the Live Scene's exact bus shape —
     //    one submitBatch (clear + 2 draws + present) and one
