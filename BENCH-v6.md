@@ -132,8 +132,50 @@ Same-run A/B (CI run 43512829206), app scene: retention ON
 13.09 ms frame (snapshot 0.161, raster 9.675) vs OFF 13.31 ms
 (snapshot 0.180, raster 10.263) — about 0.2 ms per frame
 (~1.6%), consistent across all three reported stages. The
-bigger device-side expectation is not the mean: it is the
-removal of several MB of malloc/mmap churn per draw, a
-classic per-frame jitter source that a shared CI runner
-cannot price. Checksums unchanged with retention on (it is
-the default in every test above).
+final run (43515631697, a more loaded runner) read the same
+pair as 15.37 vs 20.42 ms — same direction, but that pair
+straddles an obvious load shift, so the healthy-run figure
+is the cleaner read. The bigger device-side expectation is
+not the mean: it is the removal of several MB of malloc/mmap
+churn per draw, a classic per-frame jitter source that a
+shared CI runner cannot price. Checksums unchanged with
+retention on (it is the default in every test above).
+
+## Final measurement — governorWait pacer (CI run 43515631697)
+
+The rebuilt pacer (sleep to the last ~1 ms, then spin), same
+run, a noisier runner than the attempt-2 run (unpaced work
+mean 19.46 ms):
+
+| series | mean | stdev | p50 | p95 | max |
+|---|---|---|---|---|---|
+| unpaced control (work = interval) | 19.46 | **5.19** | 18.82 | 28.50 | 39.28 |
+| governor-paced intervals | 21.26 | **3.88** | **20.80** | 28.03 | 34.31 |
+
+The governed median interval is **exactly 20.800 ms — the
+pace tier the chip selected** (it stepped 16.7 → 20.8 at tick
+60 on a measured 20.2 ms median, and refined the grain to 2
+at tick 30 on a measured 7.8 ms jitter) — the sleep pacer's
+median had floated ~4 ms above its tier. Interval stdev fell
+25% (5.19 → 3.88) and the max fell 39.3 → 34.3 ms. What
+pacing cannot do is also visible honestly: the governed
+run's remaining tail is work spikes above the tier (work
+stdev 3.96 inside the governed run) — pacing pads short
+frames up to the tier; it never shortens a long one, and it
+never drops work.
+
+CPU proof, final run: fixed 0.03 s vs governor-supervised
+0.04 s (46 slices, slice cap now 200k), full battery green
+on both.
+
+**Where 60 FPS stands (host):** on the healthy attempt-2/3
+runner the app scene read 13.7 ms (≈73 host FPS) and the
+engine series 14.85 ms mean (≈67 FPS) — over 60 on host,
+with the fragment executor still the largest stage (the
+FragBatcher flush floor convicted in v5 is untouched by
+this round's scheduling/memory levers). On loaded runners
+the same code reads 19–24 ms — CI runner variance, stated
+plainly. The device anchor remains Sean's: v5 armed ≈ 35
+FPS unstable; v6's device verdict is his to give, with the
+governor toggle one tap away from the VPU toggle for an
+on/off A/B.
