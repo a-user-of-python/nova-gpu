@@ -84,6 +84,16 @@ struct DrawProfile {
     var totalMs: Double = 0
 }
 
+/// Per-call pass timings for plotVectors (v5 profiling). Pass 1 is
+/// the vector work (grab + VPU positioning + DDA + depth merge);
+/// pass 2 shades the accepted pixels through the fragment path.
+/// Filled by plotVectors always — two extra clock reads per call.
+struct PlotProfile {
+    var pass1Ms: Double = 0
+    var pass2Ms: Double = 0
+    var totalMs: Double = 0
+}
+
 struct GPUStats {
     var laneOps: UInt64 = 0                 // total lane-instructions executed
     var warpsIssued: UInt64 = 0
@@ -466,6 +476,8 @@ final class NovaGPU {
     private(set) var stats = GPUStats()
     /// Stage timings of the most recent draw (v4 profiling).
     private(set) var lastDrawProfile = DrawProfile()
+    /// Pass timings of the most recent plotVectors call (v5 profiling).
+    private(set) var lastPlotProfile = PlotProfile()
     static func nowMs() -> Double { ProcessInfo.processInfo.systemUptime * 1000 }
     /// When true, FragBatcher.flush() accumulates its wall time into
     /// DrawProfile.fragExecMs (two clock reads per warp flush — a
@@ -1021,6 +1033,7 @@ final class NovaGPU {
     @discardableResult
     func plotVectors(indexCount: Int, mode: Int) throws -> Double {
         let t0 = Date()
+        let pP0 = Self.nowMs()
         guard !fragmentProgram.isEmpty else { throw GPUError.badProgram }
         guard let vbSize = allocationSize(vertexBuffer) else { throw GPUError.badHandle(vertexBuffer) }
         guard let ibSize = allocationSize(indexBuffer) else { throw GPUError.badHandle(indexBuffer) }
@@ -1183,6 +1196,7 @@ final class NovaGPU {
             plotted = processRange(0, vectorCount, depthEmit)
         }
         stats.vectorsPlotted += plotted
+        let pP1 = Self.nowMs()
 
         // Pass 2: shade the accepted pixels per row chunk through
         // the ordinary fragment path (one FragBatcher per chunk,
@@ -1241,6 +1255,9 @@ final class NovaGPU {
         stats.warpsIssued += fragWarps
         let ms = Date().timeIntervalSince(t0) * 1000
         stats.lastFrameMs = ms
+        lastPlotProfile = PlotProfile(pass1Ms: pP1 - pP0,
+                                      pass2Ms: Self.nowMs() - pP1,
+                                      totalMs: ms)
         return ms
     }
 
