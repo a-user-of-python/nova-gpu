@@ -213,4 +213,13 @@ final class NovaBusClient {
     func plot(indexCount: Int, mode: Int) throws {
         _ = try submit(opcode: .plotVectors, args: [UInt64(indexCount), UInt64(mode), 0, 0, 0])
     }
+    /// v5 in-scene VPU test: arm (a0=1; resets the result window)
+    /// or disarm (a0=0). While armed, every draw positions its
+    /// triangles through the VPU path, compares them against the
+    /// shader stage's clips, and renders from the VPU positions.
+    /// Results are read from the device object by the host, like
+    /// the other statistics.
+    func vpuTest(arm: Bool) throws {
+        _ = try submit(opcode: .vpuTest, args: [arm ? 1 : 0, 0, 0, 0, 0])
+    }
 }
