@@ -51,10 +51,18 @@ enum GPOpcode: UInt32 {
     case cos    = 0x1B
     case dot3   = 0x1C   // rd = splat(dot(ra.xyz, rb.xyz))
     case dot4   = 0x1D   // rd = splat(dot(ra.xyzw, rb.xyzw))
+    // v4 vector ops (appended; existing opcodes never renumbered).
+    // These are the shader-side face of the vector unit: world-space
+    // FP32 math, executed as wide SIMD ops in the C core with the
+    // same accumulation order as DOT3/DOT4.
+    case vcross = 0x1E   // rd.xyz = cross(ra.xyz, rb.xyz), rd.w = 0
+    case vnorm  = 0x1F   // rd.xyz = normalize(ra.xyz) (RSQ semantics), rd.w = ra.w
     case cmplt  = 0x20   // rd = (ra < rb) ? 1 : 0 per component
     case sel    = 0x21   // rd = (ra != 0) ? rb : rd per component (predication)
     case f2i    = 0x22   // rd bits = Int32(ra) per component (truncation)
     case i2f    = 0x23   // rd = Float(Int32(bits of ra)) per component
+    case vmat4  = 0x24   // rd = M * ra, M = uniform rows c[b..b+3] (row-major);
+                         // component j = dot4(ra, c[b+j]); out-of-range rows read 0
     // INT32 ALU on the FP32 bit patterns, per component
     case iadd   = 0x30
     case isub   = 0x31
@@ -122,6 +130,9 @@ struct ShaderBuilder {
     mutating func cos(_ d: Int, _ a: Int)            { emit(.cos, d, a) }
     mutating func dot3(_ d: Int, _ a: Int, _ b: Int) { emit(.dot3, d, a, b) }
     mutating func dot4(_ d: Int, _ a: Int, _ b: Int) { emit(.dot4, d, a, b) }
+    mutating func vcross(_ d: Int, _ a: Int, _ b: Int) { emit(.vcross, d, a, b) }
+    mutating func vnorm(_ d: Int, _ a: Int)          { emit(.vnorm, d, a) }
+    mutating func vmat4(_ d: Int, _ a: Int, rows: Int) { emit(.vmat4, d, a, rows) }
     mutating func cmplt(_ d: Int, _ a: Int, _ b: Int){ emit(.cmplt, d, a, b) }
     mutating func sel(_ d: Int, _ a: Int, _ b: Int)  { emit(.sel, d, a, b) }
     mutating func f2i(_ d: Int, _ a: Int)            { emit(.f2i, d, a) }
@@ -254,6 +265,48 @@ private func ngp_mad_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Fl
 private func ngp_rcp_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ n: Int32)
 @_silgen_name("ngp_mov_f32")
 private func ngp_mov_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ n: Int32)
+@_silgen_name("ngp_min_f32")
+private func ngp_min_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ n: Int32)
+@_silgen_name("ngp_max_f32")
+private func ngp_max_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ n: Int32)
+@_silgen_name("ngp_sqrt_f32")
+private func ngp_sqrt_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ n: Int32)
+@_silgen_name("ngp_rsq_f32")
+private func ngp_rsq_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ n: Int32)
+@_silgen_name("ngp_cmplt_f32")
+private func ngp_cmplt_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ n: Int32)
+@_silgen_name("ngp_sel_f32")
+private func ngp_sel_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ n: Int32)
+@_silgen_name("ngp_dot3_f32")
+private func ngp_dot3_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ lanes: Int32)
+@_silgen_name("ngp_dot4_f32")
+private func ngp_dot4_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ lanes: Int32)
+@_silgen_name("ngp_cross_f32")
+private func ngp_cross_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ lanes: Int32)
+@_silgen_name("ngp_vnorm_f32")
+private func ngp_vnorm_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ lanes: Int32)
+@_silgen_name("ngp_mat4_f32")
+private func ngp_mat4_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<Float>, _ u: UnsafePointer<Float>, _ lanes: Int32)
+@_silgen_name("ngp_f2i_u32")
+private func ngp_f2i_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<Float>, _ n: Int32)
+@_silgen_name("ngp_i2f_f32")
+private func ngp_i2f_f32(_ d: UnsafeMutablePointer<Float>, _ a: UnsafePointer<UInt32>, _ n: Int32)
+@_silgen_name("ngp_iadd_u32")
+private func ngp_iadd_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<UInt32>, _ b: UnsafePointer<UInt32>, _ n: Int32)
+@_silgen_name("ngp_isub_u32")
+private func ngp_isub_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<UInt32>, _ b: UnsafePointer<UInt32>, _ n: Int32)
+@_silgen_name("ngp_imul_u32")
+private func ngp_imul_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<UInt32>, _ b: UnsafePointer<UInt32>, _ n: Int32)
+@_silgen_name("ngp_iand_u32")
+private func ngp_iand_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<UInt32>, _ b: UnsafePointer<UInt32>, _ n: Int32)
+@_silgen_name("ngp_ior_u32")
+private func ngp_ior_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<UInt32>, _ b: UnsafePointer<UInt32>, _ n: Int32)
+@_silgen_name("ngp_ixor_u32")
+private func ngp_ixor_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<UInt32>, _ b: UnsafePointer<UInt32>, _ n: Int32)
+@_silgen_name("ngp_ishl_u32")
+private func ngp_ishl_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<UInt32>, _ b: UnsafePointer<UInt32>, _ n: Int32)
+@_silgen_name("ngp_ishr_u32")
+private func ngp_ishr_u32(_ d: UnsafeMutablePointer<UInt32>, _ a: UnsafePointer<UInt32>, _ b: UnsafePointer<UInt32>, _ n: Int32)
 
 // MARK: - Executor
 //
@@ -425,63 +478,63 @@ enum ShaderExecutor {
             ngp_mul_f32(rp + df, rp + af, rp + bf, Int32(span))
         case 0x13: // DIV — C core
             ngp_div_f32(rp + df, rp + af, rp + bf, Int32(span))
-        case 0x14: // MIN — Swift.min per component (v1 expression)
-            for i in 0..<span { rp[df + i] = Swift.min(rp[af + i], rp[bf + i]) }
-        case 0x15: // MAX — Swift.max per component (v1 expression)
-            for i in 0..<span { rp[df + i] = Swift.max(rp[af + i], rp[bf + i]) }
+        case 0x14: // MIN — C core (Comparable comparison form, as v1)
+            ngp_min_f32(rp + df, rp + af, rp + bf, Int32(span))
+        case 0x15: // MAX — C core (Comparable comparison form, as v1)
+            ngp_max_f32(rp + df, rp + af, rp + bf, Int32(span))
         case 0x16: // MAD — rd = ra * rb + rd (two roundings, no fusion, as v1) — C core
             ngp_mad_f32(rp + df, rp + af, rp + bf, Int32(span))
         case 0x17: // RCP — C core (1 / x per component)
             ngp_rcp_f32(rp + df, rp + af, Int32(span))
-        case 0x18: // SQRT — v1: x <= 0 ? 0 : sqrtf(x)
-            for i in 0..<span { let x = rp[af + i]; rp[df + i] = x <= 0 ? 0 : sqrtf(x) }
-        case 0x19: // RSQ — v1: x <= 0 ? 0 : 1 / sqrtf(x)
-            for i in 0..<span { let x = rp[af + i]; rp[df + i] = x <= 0 ? 0 : 1 / sqrtf(x) }
-        case 0x1A: // SIN
+        case 0x18: // SQRT — C core (v1: x <= 0 ? 0 : sqrtf(x))
+            ngp_sqrt_f32(rp + df, rp + af, Int32(span))
+        case 0x19: // RSQ — C core (v1: x <= 0 ? 0 : 1 / sqrtf(x))
+            ngp_rsq_f32(rp + df, rp + af, Int32(span))
+        case 0x1A: // SIN — libm per component (stays scalar: no vector libm without fast-math)
             for i in 0..<span { rp[df + i] = sinf(rp[af + i]) }
-        case 0x1B: // COS
+        case 0x1B: // COS — libm per component
             for i in 0..<span { rp[df + i] = cosf(rp[af + i]) }
-        case 0x1C, 0x1D: // DOT3 / DOT4 — v1 accumulation order (s += per comp)
-            let lim = opc == 0x1C ? 3 : 4
-            for l in 0..<n {
-                let ao = af + l * 4, bo = bf + l * 4
-                var s: Float = 0
-                for c in 0..<lim { s += rp[ao + c] * rp[bo + c] }
-                vb[db + l] = SIMD4<Float>(repeating: s)
+        case 0x1C: // DOT3 — C core (v1 accumulation order, NEON planes)
+            ngp_dot3_f32(rp + df, rp + af, rp + bf, Int32(n))
+        case 0x1D: // DOT4 — C core (v1 accumulation order, NEON planes)
+            ngp_dot4_f32(rp + df, rp + af, rp + bf, Int32(n))
+        case 0x1E: // VCROSS (v4) — C core; rd.xyz = cross, rd.w = 0
+            ngp_cross_f32(rp + df, rp + af, rp + bf, Int32(n))
+        case 0x1F: // VNORM (v4) — C core; RSQ semantics, w pass-through
+            ngp_vnorm_f32(rp + df, rp + af, Int32(n))
+        case 0x20: // CMPLT — C core ((ra < rb) ? 1 : 0 per component)
+            ngp_cmplt_f32(rp + df, rp + af, rp + bf, Int32(span))
+        case 0x21: // SEL — C core (rd = (ra != 0) ? rb : rd per component)
+            ngp_sel_f32(rp + df, rp + af, rp + bf, Int32(span))
+        case 0x22: // F2I — C core (v1 expression: Int32(v.isFinite ? v : 0) bits)
+            ngp_f2i_u32(up + df, rp + af, Int32(span))
+        case 0x23: // I2F — C core (Float(Int32(bits of ra)) per component)
+            ngp_i2f_f32(rp + df, up + af, Int32(span))
+        case 0x24: // VMAT4 (v4) — rd = M * ra, M = uniform rows c[b..b+3];
+            // rows past the uniform file read as zero (LDUNIF's rule).
+            withUnsafeTemporaryAllocation(of: Float.self, capacity: 16) { rows in
+                rows.initialize(repeating: 0)
+                let base = b * 4
+                let avail = max(0, min(16, ubuf.count - base))
+                for i in 0..<avail { rows[i] = ubuf[base + i] }
+                ngp_mat4_f32(rp + df, rp + af, rows.baseAddress!, Int32(n))
             }
-        case 0x20: // CMPLT — (ra < rb) ? 1 : 0 per component
-            for i in 0..<span { rp[df + i] = rp[af + i] < rp[bf + i] ? 1 : 0 }
-        case 0x21: // SEL — rd = (ra != 0) ? rb : rd per component
-            for i in 0..<span { if rp[af + i] != 0 { rp[df + i] = rp[bf + i] } }
-        case 0x22: // F2I — v1 expression verbatim
-            for i in 0..<span {
-                let v = rp[af + i]
-                rp[df + i] = Float(bitPattern: UInt32(bitPattern: Int32(v.isFinite ? v : 0)))
-            }
-        case 0x23: // I2F — v1 expression verbatim
-            for i in 0..<span { rp[df + i] = Float(Int32(bitPattern: rp[af + i].bitPattern)) }
-        case 0x30: // IADD
-            for i in 0..<span { up[df + i] = up[af + i] &+ up[bf + i] }
-        case 0x31: // ISUB
-            for i in 0..<span { up[df + i] = up[af + i] &- up[bf + i] }
-        case 0x32: // IMUL
-            for i in 0..<span { up[df + i] = up[af + i] &* up[bf + i] }
-        case 0x33: // IAND
-            for i in 0..<span { up[df + i] = up[af + i] & up[bf + i] }
-        case 0x34: // IOR
-            for i in 0..<span { up[df + i] = up[af + i] | up[bf + i] }
-        case 0x35: // IXOR
-            for i in 0..<span { up[df + i] = up[af + i] ^ up[bf + i] }
-        case 0x36: // ISHL — shift counts masked to 31, as v1
-            for i in 0..<span {
-                let x = Int32(bitPattern: up[af + i]), y = Int32(bitPattern: up[bf + i])
-                up[df + i] = UInt32(bitPattern: x << (y & 31))
-            }
-        case 0x37: // ISHR — arithmetic shift, counts masked to 31, as v1
-            for i in 0..<span {
-                let x = Int32(bitPattern: up[af + i]), y = Int32(bitPattern: up[bf + i])
-                up[df + i] = UInt32(bitPattern: x >> (y & 31))
-            }
+        case 0x30: // IADD — C core
+            ngp_iadd_u32(up + df, up + af, up + bf, Int32(span))
+        case 0x31: // ISUB — C core
+            ngp_isub_u32(up + df, up + af, up + bf, Int32(span))
+        case 0x32: // IMUL — C core
+            ngp_imul_u32(up + df, up + af, up + bf, Int32(span))
+        case 0x33: // IAND — C core
+            ngp_iand_u32(up + df, up + af, up + bf, Int32(span))
+        case 0x34: // IOR — C core
+            ngp_ior_u32(up + df, up + af, up + bf, Int32(span))
+        case 0x35: // IXOR — C core
+            ngp_ixor_u32(up + df, up + af, up + bf, Int32(span))
+        case 0x36: // ISHL — C core (counts masked to 31, as v1)
+            ngp_ishl_u32(up + df, up + af, up + bf, Int32(span))
+        case 0x37: // ISHR — C core (arithmetic, counts masked to 31, as v1)
+            ngp_ishr_u32(up + df, up + af, up + bf, Int32(span))
         case 0x40: // LDTEX — texture(unit b).sample(ra.xy)
             for l in 0..<n {
                 let v = ctx.texSampler(b, rp[af + l * 4], rp[af + l * 4 + 1])

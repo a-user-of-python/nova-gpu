@@ -285,5 +285,131 @@ do {
     check(false, "scene suite", "\(error)")
 }
 
+// MARK: 8. v4 vector ops (VCROSS / VNORM / VMAT4) through the executor
+do {
+    // Runs a program over `lanes` lanes; attrs[lane][slot] feeds
+    // LDATTR, outputs are captured per (lane, slot).
+    func runProg(_ prog: [UInt32], lanes: Int,
+                 attrs: [[(Float, Float, Float, Float)]],
+                 uniforms: [Float])
+        -> [[(Float, Float, Float, Float)]] {
+        var outs = [[(Float, Float, Float, Float)]](repeating: [], count: lanes)
+        var ctx = WarpContext.dummy()
+        ctx.uniforms = uniforms
+        ctx.attrProvider = { lane, slot in
+            (lane < attrs.count && slot < attrs[lane].count) ? attrs[lane][slot] : (0, 0, 0, 0)
+        }
+        ctx.outWriter = { lane, slot, x, y, z, w in
+            while outs[lane].count <= slot { outs[lane].append((0, 0, 0, 0)) }
+            outs[lane][slot] = (x, y, z, w)
+        }
+        _ = ShaderExecutor.runWarp(program: prog, lanes: lanes, ctx: ctx)
+        return outs
+    }
+    func bitsEq(_ a: (Float, Float, Float, Float), _ b: (Float, Float, Float, Float)) -> Bool {
+        a.0.bitPattern == b.0.bitPattern && a.1.bitPattern == b.1.bitPattern
+            && a.2.bitPattern == b.2.bitPattern && a.3.bitPattern == b.3.bitPattern
+    }
+    // 5 lanes: not a multiple of 4, so the NEON group AND the scalar
+    // tail path both execute.
+    let lanes = 5
+    let avec: [(Float, Float, Float, Float)] = [
+        (1, 0, 0, 9), (0, 1, 0, 9), (2, -3, 5, 9), (-1.5, 0.25, 4, 9), (0, 0, 0, 9),
+    ]
+    let bvec: [(Float, Float, Float, Float)] = [
+        (0, 1, 0, 9), (0, 0, 1, 9), (-4, 2, 0.5, 9), (3, -2, 1, 9), (1, 2, 3, 9),
+    ]
+    let attrs: [[(Float, Float, Float, Float)]] = (0..<lanes).map { [avec[$0], bvec[$0]] }
+    let zeroU = [Float](repeating: 0, count: 64)
+
+    // VCROSS vs the scalar reference (same mul/sub expressions).
+    var pb = ShaderBuilder()
+    pb.ldattr(0, 0); pb.ldattr(1, 1); pb.vcross(2, 0, 1); pb.out(0, 2); pb.end()
+    let crossOut = runProg(pb.build(), lanes: lanes, attrs: attrs, uniforms: zeroU)
+    var crossOK = true
+    for l in 0..<lanes {
+        let a = avec[l], b = bvec[l]
+        let want = (a.1 * b.2 - a.2 * b.1, a.2 * b.0 - a.0 * b.2, a.0 * b.1 - a.1 * b.0, Float(0))
+        if !bitsEq(crossOut[l][0], want) { crossOK = false }
+    }
+    check(crossOK, "VCROSS matches scalar reference bit-exactly (5 lanes, NEON + tail)")
+
+    // VCROSS in place (rd == ra) must not corrupt its inputs.
+    var pbi = ShaderBuilder()
+    pbi.ldattr(0, 0); pbi.ldattr(1, 1); pbi.vcross(0, 0, 1); pbi.out(0, 0); pbi.end()
+    let crossIn = runProg(pbi.build(), lanes: lanes, attrs: attrs, uniforms: zeroU)
+    var crossInOK = true
+    for l in 0..<lanes { if !bitsEq(crossIn[l][0], crossOut[l][0]) { crossInOK = false } }
+    check(crossInOK, "VCROSS in-place (rd == ra) is correct")
+
+    // VNORM vs the documented formula (DOT3-order len2, RSQ rule).
+    var nb = ShaderBuilder()
+    nb.ldattr(0, 0); nb.vnorm(1, 0); nb.out(0, 1); nb.end()
+    let nvec: [(Float, Float, Float, Float)] = [
+        (3, 0, 4, 7), (0, 0, 0, -2), (1, 2, 2, 0), (-6, -8, 0, 1), (0.25, -0.5, 0.75, 3),
+    ]
+    let nattrs: [[(Float, Float, Float, Float)]] = (0..<lanes).map { [nvec[$0]] }
+    let normOut = runProg(nb.build(), lanes: lanes, attrs: nattrs, uniforms: zeroU)
+    var normOK = true
+    for l in 0..<lanes {
+        let v = nvec[l]
+        var len2: Float = 0
+        len2 += v.0 * v.0; len2 += v.1 * v.1; len2 += v.2 * v.2
+        let inv: Float = len2 <= 0 ? 0 : 1 / sqrtf(len2)
+        let want = (v.0 * inv, v.1 * inv, v.2 * inv, v.3)
+        if !bitsEq(normOut[l][0], want) { normOK = false }
+    }
+    check(normOK, "VNORM matches the documented formula bit-exactly (incl. zero vector, w pass-through)")
+
+    // VMAT4 vs a manual DOT4 chain: bit-identical by construction —
+    // component j of the VMAT4 result must equal the DOT4 splat of
+    // row j, for every lane.
+    let m: [Float] = [
+        0.8, 0.1, -0.3, 0.5,
+        -0.2, 1.1, 0.4, -0.6,
+        0.9, -0.7, 0.3, 0.25,
+        -0.1, 0.2, 0.45, 1.0,
+    ]
+    var unis = zeroU
+    for i in 0..<16 { unis[i] = m[i] }
+    var mb = ShaderBuilder()
+    mb.ldattr(0, 0); mb.vmat4(1, 0, rows: 0); mb.out(0, 1); mb.end()
+    let matOut = runProg(mb.build(), lanes: lanes, attrs: nattrs, uniforms: unis)
+    var db = ShaderBuilder()
+    db.ldattr(0, 0)
+    for j in 0..<4 {
+        db.ldunif(2, j); db.dot4(3, 0, 2); db.out(j, 3)
+    }
+    db.end()
+    let dotOut = runProg(db.build(), lanes: lanes, attrs: nattrs, uniforms: unis)
+    var matOK = true
+    for l in 0..<lanes {
+        let mv = matOut[l][0]
+        let comps = [dotOut[l][0].0, dotOut[l][1].1, dotOut[l][2].2, dotOut[l][3].3]
+        if mv.0.bitPattern != comps[0].bitPattern || mv.1.bitPattern != comps[1].bitPattern
+            || mv.2.bitPattern != comps[2].bitPattern || mv.3.bitPattern != comps[3].bitPattern {
+            matOK = false
+        }
+    }
+    check(matOK, "VMAT4 is bit-identical to the manual DOT4-row chain")
+
+    // VMAT4 in place + out-of-range rows read as zero.
+    var mi = ShaderBuilder()
+    mi.ldattr(0, 0); mi.vmat4(0, 0, rows: 0); mi.out(0, 0); mi.end()
+    let matIn = runProg(mi.build(), lanes: lanes, attrs: nattrs, uniforms: unis)
+    var matInOK = true
+    for l in 0..<lanes { if !bitsEq(matIn[l][0], matOut[l][0]) { matInOK = false } }
+    check(matInOK, "VMAT4 in-place (rd == ra) is correct")
+    var mz = ShaderBuilder()
+    mz.ldattr(0, 0); mz.vmat4(1, 0, rows: 14); mz.out(0, 1); mz.end()
+    let matZ = runProg(mz.build(), lanes: lanes, attrs: nattrs, uniforms: unis)
+    var matZOK = true
+    for l in 0..<lanes {
+        // Rows 14, 15 exist (zeros); rows 16, 17 are out of range (zero).
+        if !bitsEq(matZ[l][0], (0, 0, 0, 0)) { matZOK = false }
+    }
+    check(matZOK, "VMAT4 rows past the uniform file read as zero")
+}
+
 print(failures == 0 ? "\nALL HOST TESTS PASSED" : "\n\(failures) HOST TEST(S) FAILED")
 exit(failures == 0 ? 0 : 1)

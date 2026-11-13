@@ -14,3 +14,45 @@ the judge).
 - Expected: host tests unchanged (framebuffer checksums police
   bit-exactness); bench log gives the v3 stage profile.
 - Status: pushed, awaiting CI.
+
+## Baseline profile (CI bench, v3 code, runs 43472103839 + 43472970593)
+- App scene (host): frame ~26-36 ms across runs (shared-runner
+  variance); stage medians: snapshot 0.16, vertex 1.3-1.5,
+  clip 3.1-3.7, bin 2.3, raster 17.9-25.1 ms. Fragments 290,906.
+- Executor micro: lit fragment warp 0.80 us; lit vertex warp
+  2.76 us (~38 issues, closure LDATTR/OUT per lane).
+- Fragment ALU+issue is the largest identified raster CPU sink
+  (flush CPU-sum 17.9 ms lit vs 5.6 ms END-only).
+- Cluster sweep: 48 (28.3/21.7 ms) beats 24 and 96 in both runs —
+  1536 CUs stay the default; the knob is documented as
+  measured-neutral for execution (accounting granularity).
+
+## Spec changes absorbed during the round
+- 6-bit vector idea (12:23 ET) was REPLACED at 12:28 ET before any
+  code was written: world-space math FP32 (chosen over 16.16
+  fixed-point — bit-matches the existing pipeline, which is what
+  makes plot-vs-triangle pixel equivalence provable), screen-space
+  16 bits per axis (SCREEN_AXIS_BITS=16, Q10.6) in the plot unit's
+  datapath only. No 6-bit design ships.
+- VPU shape (12:30 ET): one VPU = one triangle workload (3 fetched
+  vertices, 9 FP32 axis values, 3-axis calculator, positioned
+  triangle out). VPU_COUNT = 2 x MAX_SCREEN_VECTORS, placeholder
+  MAX_SCREEN_VECTORS = 4096 until Sean's number lands.
+
+## Attempt 1 — C core completion + vector ISA ops
+- NovaGPUFast.c/.h: min/max/sqrt/rsq/cmplt/sel/f2i/i2f + all int
+  ops moved from Swift scalar loops to the C core; new NEON
+  plane-wise DOT3/DOT4/VCROSS/VMAT4 (accumulation order identical
+  to the scalar loops, zero-start so the -0 corner matches) and
+  VNORM; scalar fallbacks are alias-safe (locals first).
+- ISA appended (no renumbering): VCROSS 0x1E, VNORM 0x1F,
+  VMAT4 0x24 + ShaderBuilder support. Executor routes the moved
+  ops to C; SIN/COS stay scalar libm (no vector libm without
+  fast-math).
+- HostTests section 8: VCROSS/VNORM bit-exact vs same-expression
+  references (5 lanes = NEON group + tail), in-place aliasing,
+  VMAT4 bit-identical to the manual DOT4 chain, out-of-range
+  uniform rows read as zero.
+- Expected: all v3 checksums unchanged; executor micro-benches
+  improve; frame time improves in raster/vertex.
+- Status: pushed, awaiting CI.
