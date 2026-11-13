@@ -628,5 +628,100 @@ do {
     check(false, "v4 vertex program suite", "\(error)")
 }
 
+// MARK: 11. v5 in-draw VPU test: armed rendering, exact counts, fault detection
+do {
+    let cube = NovaGPUStandard.proofCube()                    // 12 triangles
+    let sphere = NovaGPUStandard.icosphere(subdivisions: 5)   // 20,480 triangles
+    let fbW = 256, fbH = 192
+    let fb = try client.alloc(UInt64(fbW * fbH * 4))
+    let sh = try client.alloc(8192)
+    let fs = NovaGPUStandard.fragmentLitProgram()
+    try client.uploadData(sh, off: 4096, data: NovaGPUStandard.programBytes(fs), guestStaging: STAGE)
+    try client.setShader(.setFShader, programHandle: sh, off: 4096, len: fs.count * 4)
+    try client.setFBuf(fb, fbW, fbH)
+    let mvp: [Float] = [0.8, 0, 0, 0, 0, 0.8, 0, 0, 0, 0, 0.5, 0.5, 0, 0, 0, 1]
+    try NovaGPUStandard.setLitUniforms(client, mvp: mvp, light: (0.5, 1.0, 0.25))
+
+    func uploadMesh(_ m: NovaGPUStandard.Mesh) throws -> (UInt64, UInt64) {
+        let v = try client.alloc(UInt64(m.vertices.count * 4))
+        let i = try client.alloc(UInt64(m.indices.count * 4))
+        try client.uploadData(v, data: NovaGPUStandard.vertexBytes(m), guestStaging: STAGE)
+        try client.uploadData(i, data: NovaGPUStandard.indexBytes(m), guestStaging: STAGE)
+        return (v, i)
+    }
+    let (cv, ci) = try uploadMesh(cube)
+    let (sv, si) = try uploadMesh(sphere)
+
+    func setVShader(_ vs: [UInt32]) throws {
+        try client.uploadData(sh, data: NovaGPUStandard.programBytes(vs), guestStaging: STAGE)
+        try client.setShader(.setVShader, programHandle: sh, off: 0, len: vs.count * 4)
+    }
+    func render(_ m: NovaGPUStandard.Mesh, _ v: UInt64, _ i: UInt64, arm: Bool) throws -> [UInt8] {
+        try client.setVBuf(v)
+        try client.setIBuf(i)
+        if arm { try client.vpuTest(arm: true) }
+        try client.clear(0xFF200810)
+        try client.draw(indexCount: m.indices.count)
+        if arm { try client.vpuTest(arm: false) }
+        try client.present(fb)
+        return try client.downloadData(fb, len: fbW * fbH * 4, guestStaging: DSTAGE)
+    }
+
+    // 11a. Armed rendering is byte-identical to unarmed (the VPU
+    // positions ARE the shader positions), with exact counts.
+    try setVShader(NovaGPUStandard.vertexLitProgramV4())
+    let cubeOff = try render(cube, cv, ci, arm: false)
+    let cubeOn = try render(cube, cv, ci, arm: true)
+    check(cubeOn == cubeOff, "VPU test armed: cube frame byte-identical to unarmed")
+    var t = device.gpu.vpuTest
+    check(t.trianglesTested == 12 && t.cornersCompared == 36 && t.mismatches == 0
+          && t.maxAbsError == 0 && t.clustersEngaged == 12,
+          "VPU test cube counts: 12 triangles, 36 corners, 0 mismatches, 0 error, 12 clusters",
+          "got tris=\(t.trianglesTested) corners=\(t.cornersCompared) mism=\(t.mismatches) err=\(t.maxAbsError) clusters=\(t.clustersEngaged)")
+    let sphereOff = try render(sphere, sv, si, arm: false)
+    let sphereOn = try render(sphere, sv, si, arm: true)
+    check(sphereOn == sphereOff, "VPU test armed: sphere frame byte-identical to unarmed")
+    t = device.gpu.vpuTest
+    check(t.trianglesTested == 20480 && t.mismatches == 0 && t.maxAbsError == 0
+          && t.clustersEngaged == 50,
+          "VPU test sphere counts: 20,480 triangles, 0 mismatches, all 50 MGVPU clusters",
+          "got tris=\(t.trianglesTested) mism=\(t.mismatches) err=\(t.maxAbsError) clusters=\(t.clustersEngaged)")
+    let life = device.gpu.vpuTestLifetime
+    check(life.trianglesTested == 12 + 20480 && life.mismatches == 0,
+          "VPU test lifetime accumulates across arms",
+          "lifetime tris=\(life.trianglesTested) mism=\(life.mismatches)")
+
+    // 11b. The reference is the pipeline, not one program: the v1
+    // (DOT4+SEL) vertex program's clips must also match the VPUs.
+    try setVShader(NovaGPUStandard.vertexLitProgram())
+    _ = try render(cube, cv, ci, arm: true)
+    t = device.gpu.vpuTest
+    check(t.trianglesTested == 12 && t.mismatches == 0 && t.maxAbsError == 0,
+          "VPU test also passes against the v1 vertex program's clips",
+          "got mism=\(t.mismatches) err=\(t.maxAbsError)")
+
+    // 11c. Fault injection: a perturbed VPU output must be
+    // DETECTED (one mismatched corner per triangle — corner 0 —
+    // with a real error magnitude) and must CHANGE the rendered
+    // frame, proving armed frames render from VPU positions.
+    try setVShader(NovaGPUStandard.vertexLitProgramV4())
+    NovaGPU.vpuTestFault = 0.5
+    let cubeFault = try render(cube, cv, ci, arm: true)
+    NovaGPU.vpuTestFault = 0
+    t = device.gpu.vpuTest
+    check(t.mismatches == 12 && t.maxAbsError > 0.4,
+          "VPU test detects the injected fault (12 corners, error ~0.5)",
+          "got mism=\(t.mismatches) err=\(t.maxAbsError)")
+    check(cubeFault != cubeOff, "faulty VPU positions visibly change the armed frame")
+
+    // 11d. Disarmed draws do not accumulate into the window.
+    let before = device.gpu.vpuTest.trianglesTested
+    _ = try render(cube, cv, ci, arm: false)
+    check(device.gpu.vpuTest.trianglesTested == before,
+          "disarmed draws leave the VPU test window untouched")
+} catch {
+    check(false, "VPU test suite", "\(error)")
+}
+
 print(failures == 0 ? "\nALL HOST TESTS PASSED" : "\n\(failures) HOST TEST(S) FAILED")
 exit(failures == 0 ? 0 : 1)
