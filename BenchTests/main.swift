@@ -560,14 +560,17 @@ do {
               "min_ms=\(ms(s.min() ?? 0)) fps_at_mean=\(ms(1000 / max(mean(s), 0.001)))")
     }
 
-    // 10. v6 governor A/B: the section-9 loop with the supervisor
+    // 10. Governor A/B: the section-9 loop with the supervisor
     //     chip attached, enabled over the ring, and the app's
-    //     deadline pacing applied (frame starts held to the chip's
-    //     pace tier, exactly GPUEngine's algorithm). The series
-    //     recorded is the frame INTERVAL (start to start — what a
-    //     viewer experiences as FPS stability); section 9's
-    //     back-to-back loop is the unpaced control, where the
-    //     interval equals the work time.
+    //     pacing applied exactly as GPUEngine does it — v7: frame
+    //     starts are held to the chip's pace ceiling ONLY while
+    //     the chip reports pacing engaged. The series recorded is
+    //     the frame INTERVAL (start to start — what a viewer
+    //     experiences as FPS stability); section 9's back-to-back
+    //     loop is the unpaced control, where the interval equals
+    //     the work time. On this back-to-back host loop the chip
+    //     is expected to find the frames work-bound and keep
+    //     pacing disengaged — that IS the v7-correct outcome.
     do {
         let mem = NovaMemory(totalSize: 128 * 1024 * 1024)
         let device = NovaGPUDevice()
@@ -609,17 +612,25 @@ do {
         var paceNextStart: Double? = nil   // ms on the NovaGPU.nowMs() clock
         var lastStart: Double? = nil
         for _ in 0..<90 {
-            // GPUEngine's pacing: hold the frame start to the
-            // chip's current pace tier; late frames start fresh.
-            let interval = gov.chip.paceTargetMs
-            let now0 = NovaGPU.nowMs()
-            if let next = paceNextStart, now0 < next {
-                governorWait(untilMs: next)
+            // GPUEngine's pacing (v7): hold the frame start to
+            // the chip's pace ceiling while pacing is engaged;
+            // late frames start fresh; no wait at all otherwise.
+            if gov.chip.pacingEngaged {
+                let interval = gov.chip.paceCeilingMs
+                let now0 = NovaGPU.nowMs()
+                if let next = paceNextStart, now0 < next {
+                    governorWait(untilMs: next)
+                }
+                let start = NovaGPU.nowMs()
+                paceNextStart = max(start, paceNextStart ?? start) + interval
+                if let ls = lastStart { intervals.append(start - ls) }
+                lastStart = start
+            } else {
+                paceNextStart = nil
+                let start = NovaGPU.nowMs()
+                if let ls = lastStart { intervals.append(start - ls) }
+                lastStart = start
             }
-            let start = NovaGPU.nowMs()
-            paceNextStart = max(start, paceNextStart ?? start) + interval
-            if let ls = lastStart { intervals.append(start - ls) }
-            lastStart = start
             angle += 0.02
             let mvpS = NovaGPUStandard.matMul(proj, NovaGPUStandard.matMul(
                 NovaGPUStandard.matRotX(0.5),
@@ -659,28 +670,35 @@ do {
         let settled = Array(intervals.dropFirst(45))
         bench("governor-settled frames=\(settled.count) interval_mean_ms=\(ms(mean(settled))) interval_stdev_ms=\(ms(stdev(settled))) " +
               "p50_ms=\(ms(pct(settled, 0.50))) p95_ms=\(ms(pct(settled, 0.95))) max_ms=\(ms(settled.max() ?? 0)) min_ms=\(ms(settled.min() ?? 0))")
-        bench("governor-state pace_ms=\(ms(gov.chip.paceTargetMs)) width=\(gov.chip.gpuStageWidth) " +
+        bench("governor-state ceiling_ms=\(ms(gov.chip.paceCeilingMs)) pacing=\(gov.chip.pacingStateText) width=\(gov.chip.gpuStageWidth) " +
               "grain=\(gov.chip.rasterChunkRows) actions=\(gov.chip.actionsIssued) ticks=\(gov.chip.tickCount)")
         for a in gov.chip.actionLog { bench("governor-action \(a.text)") }
     }
 
-    // 11. v7 REPRODUCTION — device-like slow series through the
-    //     shipped governor, app-identical attach + pacing. The
-    //     iPad verdict on v6 was a stable 19.2 FPS (a 52.1 ms
-    //     interval ≈ the 50 ms pace tier + loop overhead) from a
-    //     scene that ran ~35 FPS ungoverned. Host work is too
-    //     fast to reach that regime, so each frame's work is
-    //     padded to a scripted device-like target: phase A cycles
+    // 11. Device-like slow series A/B — the section that
+    //     convicted v6 (attempt 0) and now proves v7. The iPad
+    //     verdict on v6 was a stable 19.2 FPS (a 52.1 ms interval
+    //     ≈ the 50 ms pace tier + loop overhead) from a scene
+    //     that ran ~35 FPS ungoverned. Host work is too fast to
+    //     reach that regime, so each frame's work is padded to a
+    //     scripted device-like target: phase A cycles
     //     [33, 35, 34, 36, 35, 52] ms (median 35 — above the
     //     33.3 ms tier's 34.0 ms overrun line, the condition the
-    //     device outcome implies), then phase B drops to 12 ms
-    //     to test whether the governed rate can ever come back.
+    //     device outcome implies), then phase B drops to 12 ms.
+    //     With the shipped v6 chip this run walked the ladder to
+    //     50.0 and phase B stayed pinned there (governed 62.8 ms
+    //     vs control 19.9 ms — CI 43531474943). The v7 bar is the
+    //     never-slower law: governed ≈ control in BOTH phases,
+    //     with the chip's pacing state and action log printed so
+    //     the behaviour (engaged where there is headroom,
+    //     disengaged where the loop is work-bound, guard firing
+    //     if a lever costs frames) is visible in the numbers.
     //     The padding is a wait inside the work segment; the
     //     governor, the pacing algorithm and the telemetry path
     //     (notePresent on real presents) are exactly the app's.
     do {
         func slowRun(_ governed: Bool) throws -> (intervals: [Double], works: [Double],
-                                                  tier: Double, log: [String]) {
+                                                  ceiling: Double, pacing: String, log: [String]) {
             let mem = NovaMemory(totalSize: 128 * 1024 * 1024)
             let device = NovaGPUDevice()
             let client = NovaBusClient(memory: mem, device: device)
@@ -723,10 +741,11 @@ do {
             var lastStart: Double? = nil
             for frame in 0..<200 {
                 let target = frame < 130 ? patternA[frame % patternA.count] : 12.0
-                // GPUEngine's pacing (v6): hold the frame start to
-                // the chip's current pace target.
-                if governed {
-                    let interval = gov.chip.paceTargetMs
+                // GPUEngine's pacing (v7): hold the frame start to
+                // the chip's pace ceiling while the chip reports
+                // pacing engaged; no wait at all otherwise.
+                if governed, gov.chip.pacingEngaged {
+                    let interval = gov.chip.paceCeilingMs
                     let now0 = NovaGPU.nowMs()
                     if let next = paceNextStart, now0 < next {
                         governorWait(untilMs: next)
@@ -774,7 +793,7 @@ do {
                 if NovaGPU.nowMs() < deadline { governorWait(untilMs: deadline) }
                 works.append(NovaGPU.nowMs() - t0)
             }
-            return (intervals, works, gov.chip.paceTargetMs,
+            return (intervals, works, gov.chip.paceCeilingMs, gov.chip.pacingStateText,
                     gov.chip.actionLog.map { $0.text })
         }
         func phaseStats(_ name: String, _ iv: [Double], _ wk: [Double]) {
@@ -795,7 +814,7 @@ do {
         phaseStats("control", control.intervals, control.works)
         let governed = try slowRun(true)
         phaseStats("governed", governed.intervals, governed.works)
-        bench("slowseries-governed final_pace_ms=\(ms(governed.tier))")
+        bench("slowseries-governed final_ceiling_ms=\(ms(governed.ceiling)) pacing_state=\(governed.pacing)")
         for line in governed.log { bench("slowseries-action \(line)") }
     }
 } catch {

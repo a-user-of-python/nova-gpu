@@ -170,6 +170,19 @@ final class NovaGPUDevice {
     private var presentReady = false
     private(set) var descriptorsExecuted: UInt64 = 0
 
+    /// v7: host wall time the device has spent executing work
+    /// since the last consumeBusyMs() — the governor's pure WORK
+    /// sensor. It accumulates only inside servicePendingWork(),
+    /// so it excludes every wait (pacing, timers, UI) by
+    /// construction.
+    private var busyAccumMs: Double = 0
+
+    /// Reads and clears the accumulated device busy time.
+    func consumeBusyMs() -> Double {
+        defer { busyAccumMs = 0 }
+        return busyAccumMs
+    }
+
     static let deviceID: UInt64 = 0x4E47_5055_0001_0000
 
     func attach(to memory: NovaMemory) {
@@ -183,6 +196,7 @@ final class NovaGPUDevice {
         reqSeq = 0; suspended = nil; presentReady = false
         drainPending = false; pendingAck = 0
         descriptorsExecuted = 0
+        busyAccumMs = 0
     }
 
     // MARK: MMIO
@@ -239,6 +253,7 @@ final class NovaGPUDevice {
     /// by a CPU host between run slices. This is the only place the
     /// device touches guest RAM.
     func servicePendingWork() {
+        let t0 = NovaGPU.nowMs()
         if pendingAck != 0 {
             let seq = pendingAck
             pendingAck = 0
@@ -248,6 +263,7 @@ final class NovaGPUDevice {
             drainPending = false
             drain()
         }
+        busyAccumMs += NovaGPU.nowMs() - t0
     }
 
     private func descriptorAddress(_ index: UInt64) -> UInt64? {

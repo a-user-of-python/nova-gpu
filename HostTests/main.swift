@@ -769,7 +769,7 @@ do {
     check(wideOK, "VPU.positionWide is bit-identical to per-triangle VPU.position (groups 1..250 triangles)")
 }
 
-// MARK: 13. v6 governor chip: registers, ring, policy, pixel invariance
+// MARK: 13. Governor chip: registers, ring, lever policy, pixel invariance
 do {
     let govBase = NovaMemory.govBaseAddr
     check(NovaGovernor.chipName == "NovaGovernor", "governor chip name lives in one place")
@@ -789,11 +789,13 @@ do {
     check(govA.chip.lastFrameMs == 30, "governor MMIO tick carries frame microseconds")
     check(mem.mmioRead(govBase + GovRegister.medianUs.rawValue) == 30000,
           "governor median register reads back the scripted window")
-    check(govA.chip.paceTierIndex >= 1 && govA.chip.actionsIssued >= 2,
-          "governor stepped the pace tier on scripted 30 ms frames",
-          "tier \(govA.chip.paceTierIndex), \(govA.chip.actionsIssued) actions")
+    check(govA.chip.paceCeilingMs == 30 && !govA.chip.pacingEngaged,
+          "governor ceiling tracks the work p25; pacing stays off on work-only ticks",
+          "ceiling \(govA.chip.paceCeilingMs) ms, state \(govA.chip.pacingStateText)")
+    check(mem.mmioRead(govBase + GovRegister.paceCeilingUs.rawValue) == 30000,
+          "governor ceiling register reads back the work p25")
     mem.mmioWrite(govBase + GovRegister.enable.rawValue, 0)
-    check(!govA.chip.enabled && govA.chip.paceTierIndex == 0,
+    check(!govA.chip.enabled && !govA.chip.pacingEngaged && govA.chip.gpuStageWidth == 0,
           "governor disable via MMIO restores the v5 operating point")
 
     // Ring opcode 21 on the shared device.
@@ -806,18 +808,9 @@ do {
     check(!govRing.chip.enabled, "governor disables via ring opcode 21")
     device.governor = nil
 
-    // Policy: pace tiers walk down under sustained overrun and
-    // back up under sustained headroom (deterministic script).
-    let pace = NovaGovernor()
-    pace.setEnabled(true)
-    for _ in 0..<120 { pace.tick(GovernorTelemetry(frameWorkMs: 30)) }
-    check(pace.paceTierIndex == 3, "pace tier steps 16.7 -> 33.3 under 30 ms frames",
-          "tier \(pace.paceTierIndex) (\(pace.paceTargetMs) ms)")
-    check(pace.actionLog.filter { $0.command == .setPaceTier }.count >= 3,
-          "pace steps are logged with reasons")
-    for _ in 0..<260 { pace.tick(GovernorTelemetry(frameWorkMs: 8)) }
-    check(pace.paceTierIndex == 0, "pace tier climbs back to 16.7 under 8 ms frames",
-          "tier \(pace.paceTierIndex)")
+    // Pacing policy traces live in section 14 (the v7
+    // never-slower law replaced the v6 tier ladder — the ladder
+    // was the bug: see V7-LEDGER.md).
 
     // Policy: jitter refines the grain, then caps the width;
     // stability restores both.
@@ -922,6 +915,84 @@ do {
     note("governor ticks during governed render: \(govTicks)")
 } catch {
     check(false, "governor suite", "\(error)")
+}
+
+// MARK: 14. v7 pacing policy: the never-slower law (scripted traces)
+do {
+    // Work-bound loop (interval == work): pacing must never
+    // engage, and the ceiling must equal the demonstrated work.
+    let wb = NovaGovernor()
+    wb.setEnabled(true)
+    for _ in 0..<120 { wb.tick(GovernorTelemetry(frameWorkMs: 35, frameIntervalMs: 35)) }
+    check(!wb.pacingEngaged && wb.paceCeilingMs == 35,
+          "work-bound loop: pacing stays disengaged, ceiling = work p25",
+          "state \(wb.pacingStateText), ceiling \(wb.paceCeilingMs)")
+    check(wb.pacingStateText.contains("work-bound"),
+          "pacing state text names the work-bound reason",
+          wb.pacingStateText)
+
+    // The device trace: the numbers v6's sensor saw on the iPad
+    // (work 35 ms, intervals inflated to ~52 by its own padding).
+    // v7 may engage only at a ceiling of the work p25 — 35 ms,
+    // never a 50 ms tier — and when the work drops, pacing
+    // disengages and the ceiling re-derives with the window.
+    let dev = NovaGovernor()
+    dev.setEnabled(true)
+    for i in 0..<120 {
+        dev.tick(GovernorTelemetry(frameWorkMs: 35,
+                                   frameIntervalMs: [46.0, 52.0, 58.0][i % 3]))
+    }
+    check(dev.pacingEngaged && dev.paceCeilingMs == 35,
+          "device trace: pacing engages at the work-p25 ceiling (35), not a 50 tier",
+          "ceiling \(dev.paceCeilingMs)")
+    for _ in 0..<60 { dev.tick(GovernorTelemetry(frameWorkMs: 12, frameIntervalMs: 12)) }
+    check(!dev.pacingEngaged && dev.paceCeilingMs == 12,
+          "no lock-in: fast work disengages pacing and the ceiling re-derives to 12",
+          "ceiling \(dev.paceCeilingMs), state \(dev.pacingStateText)")
+
+    // Headroom + jitter: pacing engages. Then the governed
+    // intervals inflate past the ungoverned estimate — governing
+    // is costing frames — and the A/B guard must trip, disengage
+    // pacing, and say so in plain words. Afterwards a lockout +
+    // fresh probe keep it off even when headroom returns.
+    let gd = NovaGovernor()
+    gd.setEnabled(true)
+    for i in 0..<120 {
+        gd.tick(GovernorTelemetry(frameWorkMs: 14,
+                                  frameIntervalMs: [18.0, 20.0, 22.0][i % 3]))
+    }
+    check(gd.pacingEngaged && gd.paceCeilingMs == 14,
+          "headroom + jitter: pacing engages at the work p25",
+          "ceiling \(gd.paceCeilingMs)")
+    for _ in 0..<80 { gd.tick(GovernorTelemetry(frameWorkMs: 14, frameIntervalMs: 30)) }
+    check(!gd.pacingEngaged &&
+          gd.actionLog.contains { $0.text.contains("pacing disengaged: it was costing frames") },
+          "A/B guard trips and logs 'pacing disengaged: it was costing frames'")
+    for i in 0..<60 {
+        gd.tick(GovernorTelemetry(frameWorkMs: 14,
+                                  frameIntervalMs: [18.0, 20.0, 22.0][i % 3]))
+    }
+    check(!gd.pacingEngaged, "guard lockout + fresh probe keep pacing off after a trip")
+
+    // The guard covers the other levers too: jitter with slop
+    // caps the GPU width; when intervals then inflate, the guard
+    // reverts the width cap with the same plain-words log.
+    let wd = NovaGovernor()
+    wd.setEnabled(true)
+    for i in 0..<140 {
+        let w: Double = i % 6 == 5 ? 40 : 14
+        wd.tick(GovernorTelemetry(frameWorkMs: w, frameIntervalMs: w + 6))
+    }
+    check(wd.gpuStageWidth == 6, "jitter with slop caps GPU width at 6",
+          "width \(wd.gpuStageWidth)")
+    for i in 0..<80 {
+        let w: Double = i % 6 == 5 ? 40 : 14
+        wd.tick(GovernorTelemetry(frameWorkMs: w, frameIntervalMs: w + 26))
+    }
+    check(wd.gpuStageWidth == 0 &&
+          wd.actionLog.contains { $0.text.contains("costing frames") },
+          "A/B guard reverts the width cap when it costs frames",
+          "width \(wd.gpuStageWidth)")
 }
 
 print(failures == 0 ? "\nALL HOST TESTS PASSED" : "\n\(failures) HOST TEST(S) FAILED")

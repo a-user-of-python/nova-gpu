@@ -95,10 +95,56 @@ the ratchet, in one run.
 - Expected: governed tier → 50; governed slow-phase tail
   ≈ 50 ms vs control ≈ 37.5 ms; governed fast phase stays
   ≈ 50 ms (lock-in) vs control ≈ work speed.
-- Measured: (pending CI)
+- Measured (CI run 43531474943, all jobs green): **reproduced.**
+  The runner was slow that run (real scene work ~48 ms, so the
+  scripted targets acted as floors and phase-A work ran hotter
+  than scripted — the ratchet fired anyway, across regimes).
+  The governed action log shows the full ladder walk —
+  SET_PACE_TIER 20.8 @ tick 60 → 25.0 @ 120 → 33.3 @ 151 →
+  **50.0 @ 182** — and the phases convict the lock-in:
+  - Phase A tail: governed 49.4 ms (20.3 FPS) settling onto
+    the 50 ms tier.
+  - Phase B (work back to fast): governed interval mean
+    **62.8 ms (15.9 FPS)** vs control **19.9 ms (50.1 FPS)** —
+    the governed loop stayed pinned at the top tier while the
+    identical ungoverned loop ran 3× faster. The headroom
+    test (median < 26.6 ms) is unreachable from inside the
+    padding, exactly as diagnosed.
+  Status: DONE — mechanism convicted from source + reproduction.
 
 ## Attempt 1 — the fix
-- (pending)
+- NovaGovernor.swift: policy rewritten per the design above —
+  separate work/interval windows; ceiling = work p25, no
+  ladder; 24-frame ungoverned probe calibrates the slop;
+  work-bound disengagement; engagement requires slack +
+  jitter + no lockout; A/B guard with TWO trip channels
+  (governed interval vs ungoverned estimate; work median vs
+  the snapshot taken when the newest lever was applied —
+  grain/width costs hide inside the work time) reverting the
+  newest lever with a plain-words "costing frames" log; HUD
+  state text (pacingStateText) says engaged / calibrating /
+  disengaged + why. Device ID bumped to v7.0; new registers
+  pacingState / workMedianUs / workP25Us; paceTierUs slot now
+  reports the ceiling.
+- NovaBus.swift: NovaGPUDevice accumulates its busy time in
+  servicePendingWork (consumeBusyMs); notePresent now ticks
+  the chip with work (busy) and interval (present-to-present)
+  as separate samples.
+- GPUEngine.swift: pacing wait only while the chip reports
+  pacing engaged, targeting paceCeilingMs; HUD gains
+  "Governor pacing" (state + reason) and "Governor pace
+  ceiling" rows beside the existing jitter rows.
+- BenchTests: §10 runs the v7 app algorithm (engaged-gated);
+  §11 is now the v7 A/B proof on the same device-like series.
+- HostTests: §13 tier assertions replaced with v7 ceiling /
+  disengagement assertions; new §14 deterministic traces —
+  work-bound, the device trace (engage @ 35, never 50; no
+  lock-in at 12), the guard trip with the exact log phrase +
+  lockout, and the width-cap guard revert.
+- Expected: all pre-v7 checksums intact; §13+§14 green; §11
+  governed ≈ control in both phases with the pacing state and
+  log printed.
+- Measured: (pending CI)
 
 ## Attempt 2 — close-out
 - (pending)

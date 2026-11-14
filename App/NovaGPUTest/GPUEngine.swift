@@ -35,9 +35,10 @@ final class GPUEngine: ObservableObject {
         queue.async { self.vpuWanted = on }
     }
 
-    // v6 governor HUD state (written from the frame loop below).
+    // v6/v7 governor HUD state (written from the frame loop below).
     @Published var govOn = false
-    @Published var govPaceMs: Double = 0
+    @Published var govCeilingMs: Double = 0
+    @Published var govPacingText = "off"
     @Published var govMedianMs: Double = 0
     @Published var govP95Ms: Double = 0
     @Published var govJitterMs: Double = 0
@@ -51,8 +52,10 @@ final class GPUEngine: ObservableObject {
 
     /// The governor toggle: enable/disable travel over the bus
     /// (ring opcode 21) at the top of the next frame batch, and
-    /// while enabled the frame loop holds frame starts to the
-    /// chip's pace tier. The chip ticks itself on every PRESENT.
+    /// while the chip's pacing is ENGAGED the frame loop holds
+    /// frame starts to the chip's pace ceiling (the p25 of recent
+    /// frame work — v7; the chip disengages pacing itself when
+    /// the loop is work-bound). The chip ticks on every PRESENT.
     func setGovernor(_ on: Bool) {
         DispatchQueue.main.async { self.govOn = on }
         queue.async { self.govWanted = on }
@@ -144,14 +147,18 @@ final class GPUEngine: ObservableObject {
 
     private func renderFrame() {
         guard ready else { return }
-        // v6 governor pacing: while the chip is enabled, frame
-        // starts are held to the chip's pace tier — a steady
-        // cadence instead of the raw 16 ms timer firing whenever.
-        // A frame that overruns its slot starts the next slot from
-        // now (no catch-up debt). The sleep is before t0, so
-        // frameMs below still measures work, not pacing.
-        if govWanted, let gov = governor {
-            let interval = gov.chip.paceTargetMs
+        // v7 governor pacing: while the chip's pacing is ENGAGED,
+        // frame starts are held to the chip's pace ceiling — the
+        // p25 of recent frame work, never a fixed tier — for a
+        // steady cadence instead of the raw 16 ms timer firing
+        // whenever. A frame that overruns its slot starts the
+        // next slot from now (no catch-up debt). While pacing is
+        // disengaged (work-bound loop, guard lockout, calibrating)
+        // there is no wait at all: the governor may never trade
+        // speed for stability. The sleep is before t0, so frameMs
+        // below still measures work, not pacing.
+        if govWanted, let gov = governor, gov.chip.pacingEngaged {
+            let interval = gov.chip.paceCeilingMs
             let now = NovaGPU.nowMs()
             if paceNextStartMs > 0, now < paceNextStartMs {
                 governorWait(untilMs: paceNextStartMs)
@@ -251,9 +258,10 @@ final class GPUEngine: ObservableObject {
                     self.vpuPassMs = vt.passMs
                 }
                 if let chip = chip {
-                    self.govPaceMs = chip.paceTargetMs
-                    self.govMedianMs = chip.windowMedianMs
-                    self.govP95Ms = chip.windowP95Ms
+                    self.govCeilingMs = chip.paceCeilingMs
+                    self.govPacingText = chip.pacingStateText
+                    self.govMedianMs = chip.intervalMedianMs
+                    self.govP95Ms = chip.intervalP95Ms
                     self.govJitterMs = chip.jitterMs
                     self.govWidth = chip.gpuStageWidth
                     self.govGrain = chip.rasterChunkRows
@@ -351,7 +359,8 @@ struct LiveSceneView: View {
                     GridRow { Text("VPU pass time"); Text(String(format: "%.2f ms", engine.vpuPassMs)).bold() }
                 }
                 if engine.govOn {
-                    GridRow { Text("Governor pace target"); Text(String(format: "%.1f ms", engine.govPaceMs)).bold() }
+                    GridRow { Text("Governor pacing"); Text(engine.govPacingText).bold() }
+                    GridRow { Text("Governor pace ceiling"); Text(String(format: "%.1f ms", engine.govCeilingMs)).bold() }
                     GridRow { Text("Frame interval p50 / p95"); Text(String(format: "%.1f / %.1f ms", engine.govMedianMs, engine.govP95Ms)).bold() }
                     GridRow { Text("Frame jitter (p95 − p50)"); Text(String(format: "%.1f ms", engine.govJitterMs)).bold() }
                     GridRow { Text("GPU width / raster grain"); Text(engine.govWidth == 0 ? "uncapped / \(engine.govGrain)" : "\(engine.govWidth) / \(engine.govGrain)").bold() }
