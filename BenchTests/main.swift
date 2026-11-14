@@ -663,6 +663,141 @@ do {
               "grain=\(gov.chip.rasterChunkRows) actions=\(gov.chip.actionsIssued) ticks=\(gov.chip.tickCount)")
         for a in gov.chip.actionLog { bench("governor-action \(a.text)") }
     }
+
+    // 11. v7 REPRODUCTION — device-like slow series through the
+    //     shipped governor, app-identical attach + pacing. The
+    //     iPad verdict on v6 was a stable 19.2 FPS (a 52.1 ms
+    //     interval ≈ the 50 ms pace tier + loop overhead) from a
+    //     scene that ran ~35 FPS ungoverned. Host work is too
+    //     fast to reach that regime, so each frame's work is
+    //     padded to a scripted device-like target: phase A cycles
+    //     [33, 35, 34, 36, 35, 52] ms (median 35 — above the
+    //     33.3 ms tier's 34.0 ms overrun line, the condition the
+    //     device outcome implies), then phase B drops to 12 ms
+    //     to test whether the governed rate can ever come back.
+    //     The padding is a wait inside the work segment; the
+    //     governor, the pacing algorithm and the telemetry path
+    //     (notePresent on real presents) are exactly the app's.
+    do {
+        func slowRun(_ governed: Bool) throws -> (intervals: [Double], works: [Double],
+                                                  tier: Double, log: [String]) {
+            let mem = NovaMemory(totalSize: 128 * 1024 * 1024)
+            let device = NovaGPUDevice()
+            let client = NovaBusClient(memory: mem, device: device)
+            let gov = NovaGovernorDevice()
+            gov.attach(to: mem)
+            gov.supervise(device)
+            device.governor = gov
+            let fbW = 640, fbH = 480
+            let STAGE: UInt64 = 0x40000, DSTAGE: UInt64 = 0x80000
+            let sphere = NovaGPUStandard.icosphere(subdivisions: 5)
+            let torus = NovaGPUStandard.torus(rings: 96, slices: 48)
+            let fb = try client.alloc(UInt64(fbW * fbH * 4))
+            let sh = try client.alloc(8192)
+            try client.uploadData(sh, data: NovaGPUStandard.programBytes(vsLitV4), guestStaging: STAGE)
+            try client.uploadData(sh, off: 4096, data: NovaGPUStandard.programBytes(fsLit), guestStaging: STAGE)
+            try client.setShader(.setVShader, programHandle: sh, off: 0, len: vsLitV4.count * 4)
+            try client.setShader(.setFShader, programHandle: sh, off: 4096, len: fsLit.count * 4)
+            try client.setFBuf(fb, fbW, fbH)
+            try client.setUniform(4, (1, 0, 0, 0))
+            try client.setUniform(5, (0, 1, 0, 0))
+            try client.setUniform(6, (0, 0, 1, 0))
+            try client.setUniform(7, (0, 0, 0, 1))
+            try client.setUniform(8, (0.577, 0.577, 0.577, 0))
+            try client.setUniform(9, (1, 1, 1, 1))
+            let sphereV = try client.alloc(UInt64(sphere.vertices.count * 4))
+            let sphereI = try client.alloc(UInt64(sphere.indices.count * 4))
+            try client.uploadData(sphereV, data: NovaGPUStandard.vertexBytes(sphere), guestStaging: STAGE)
+            try client.uploadData(sphereI, data: NovaGPUStandard.indexBytes(sphere), guestStaging: STAGE)
+            let torusV = try client.alloc(UInt64(torus.vertices.count * 4))
+            let torusI = try client.alloc(UInt64(torus.indices.count * 4))
+            try client.uploadData(torusV, data: NovaGPUStandard.vertexBytes(torus), guestStaging: STAGE)
+            try client.uploadData(torusI, data: NovaGPUStandard.indexBytes(torus), guestStaging: STAGE)
+            if governed { try client.governorControl(1) }   // enable over the ring, as the app does
+            let proj = NovaGPUStandard.matPerspective(k: 0.45)
+            let patternA: [Double] = [33, 35, 34, 36, 35, 52]
+            var intervals: [Double] = []
+            var works: [Double] = []
+            var angle: Float = 0
+            var paceNextStart: Double? = nil
+            var lastStart: Double? = nil
+            for frame in 0..<200 {
+                let target = frame < 130 ? patternA[frame % patternA.count] : 12.0
+                // GPUEngine's pacing (v6): hold the frame start to
+                // the chip's current pace target.
+                if governed {
+                    let interval = gov.chip.paceTargetMs
+                    let now0 = NovaGPU.nowMs()
+                    if let next = paceNextStart, now0 < next {
+                        governorWait(untilMs: next)
+                    }
+                    let start = NovaGPU.nowMs()
+                    paceNextStart = max(start, paceNextStart ?? start) + interval
+                    if let ls = lastStart { intervals.append(start - ls) }
+                    lastStart = start
+                } else {
+                    let start = NovaGPU.nowMs()
+                    if let ls = lastStart { intervals.append(start - ls) }
+                    lastStart = start
+                }
+                angle += 0.02
+                let mvpS = NovaGPUStandard.matMul(proj, NovaGPUStandard.matMul(
+                    NovaGPUStandard.matRotX(0.5),
+                    NovaGPUStandard.matMul(NovaGPUStandard.matRotY(angle), NovaGPUStandard.matScale(0.72))))
+                let mvpT = NovaGPUStandard.matMul(proj, NovaGPUStandard.matMul(
+                    NovaGPUStandard.matTranslate(-0.05, -0.1, 0.35),
+                    NovaGPUStandard.matMul(NovaGPUStandard.matRotX(1.1),
+                                           NovaGPUStandard.matMul(NovaGPUStandard.matRotY(angle * 0.6),
+                                                                  NovaGPUStandard.matScale(0.62)))))
+                var batch: [(opcode: GPUCommand, fence: UInt64, args: [UInt64])] = []
+                batch.append((opcode: .clear, fence: 0, args: [UInt64(0xFF200810), 0, 0, 0, 0]))
+                for (mvp, vb, ib, idx) in [(mvpS, sphereV, sphereI, sphere.indices.count),
+                                           (mvpT, torusV, torusI, torus.indices.count)] {
+                    for r in 0..<4 {
+                        batch.append((opcode: .setUniform, fence: 0,
+                                      args: [UInt64(r), UInt64(mvp[r * 4].bitPattern),
+                                             UInt64(mvp[r * 4 + 1].bitPattern), UInt64(mvp[r * 4 + 2].bitPattern),
+                                             UInt64(mvp[r * 4 + 3].bitPattern)]))
+                    }
+                    batch.append((opcode: .setVBuf, fence: 0, args: [vb, 0, 0, 0, 0]))
+                    batch.append((opcode: .setIBuf, fence: 0, args: [ib, 0, 0, 0, 0]))
+                    batch.append((opcode: .draw, fence: 0, args: [UInt64(idx), 0, 0, 0, 0]))
+                }
+                batch.append((opcode: .present, fence: 0, args: [fb, 0, 0, 0, 0]))
+                let t0 = NovaGPU.nowMs()
+                try client.submitBatch(batch)
+                _ = try client.downloadData(fb, len: fbW * fbH * 4, guestStaging: DSTAGE)
+                // Simulated device load: pad this frame's work up
+                // to the scripted target (a no-op when the real
+                // work already exceeds it).
+                let deadline = t0 + target
+                if NovaGPU.nowMs() < deadline { governorWait(untilMs: deadline) }
+                works.append(NovaGPU.nowMs() - t0)
+            }
+            return (intervals, works, gov.chip.paceTargetMs,
+                    gov.chip.actionLog.map { $0.text })
+        }
+        func phaseStats(_ name: String, _ iv: [Double], _ wk: [Double]) {
+            // iv[i] is the interval ENDING at frame i+1; wk[i] is
+            // frame i's work. Phase A: frames 10..<130, tail
+            // 100..<130. Phase B: frames 140..<200.
+            let ivA = Array(iv[9..<129]), wkA = Array(wk[10..<130])
+            let ivTail = Array(iv[99..<129])
+            let ivB = Array(iv[139..<199]), wkB = Array(wk[140..<200])
+            bench("slowseries-\(name) phaseA work_mean_ms=\(ms(mean(wkA))) interval_mean_ms=\(ms(mean(ivA))) " +
+                  "interval_stdev_ms=\(ms(stdev(ivA))) fps_at_mean=\(ms(1000 / max(mean(ivA), 0.001)))")
+            bench("slowseries-\(name) phaseA-tail interval_mean_ms=\(ms(mean(ivTail))) " +
+                  "interval_stdev_ms=\(ms(stdev(ivTail))) fps_at_mean=\(ms(1000 / max(mean(ivTail), 0.001)))")
+            bench("slowseries-\(name) phaseB work_mean_ms=\(ms(mean(wkB))) interval_mean_ms=\(ms(mean(ivB))) " +
+                  "interval_stdev_ms=\(ms(stdev(ivB))) fps_at_mean=\(ms(1000 / max(mean(ivB), 0.001)))")
+        }
+        let control = try slowRun(false)
+        phaseStats("control", control.intervals, control.works)
+        let governed = try slowRun(true)
+        phaseStats("governed", governed.intervals, governed.works)
+        bench("slowseries-governed final_pace_ms=\(ms(governed.tier))")
+        for line in governed.log { bench("slowseries-action \(line)") }
+    }
 } catch {
     print("BENCH FAILED: \(error)")
     exit(1)
