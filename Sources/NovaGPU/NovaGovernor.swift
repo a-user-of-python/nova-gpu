@@ -213,6 +213,8 @@ final class NovaGovernor {
     private var guardStreak = 0
     private var guardWorkStreak = 0
     private var guardLockoutUntilTick: UInt64 = 0
+    private var widthLockoutUntilTick: UInt64 = 0   // guard-convicted levers stay off a while
+    private var grainLockoutUntilTick: UInt64 = 0
     private var lastWorkBound = false
     private var leverStack: [Lever] = []             // applied levers, oldest first
     private var leverWorkBaselineMs: Double? = nil   // work median when the newest lever was applied
@@ -234,7 +236,10 @@ final class NovaGovernor {
             baselineSlopMs = nil
             probeTicks = 0
             guardStreak = 0
+            guardWorkStreak = 0
             guardLockoutUntilTick = 0
+            widthLockoutUntilTick = 0
+            grainLockoutUntilTick = 0
             ticksSinceCommand = 0
             issue(.enable, Self.chipName, "enabled by host")
         } else {
@@ -344,10 +349,12 @@ final class NovaGovernor {
                   "pacing disengaged: it was costing frames (\(reason))")
         case .width:
             gpuStageWidth = 0
+            widthLockoutUntilTick = tickCount + Self.guardLockoutTicks
             issue(.setGPUWidth, "uncapped",
                   "GPU width cap reverted: it was costing frames (\(reason))")
         case .grain:
             rasterChunkRows = Self.grainDefault
+            grainLockoutUntilTick = tickCount + Self.guardLockoutTicks
             issue(.setRasterGrain, "\(rasterChunkRows) rows/chunk",
                   "raster grain restored: it was costing frames (\(reason))")
         }
@@ -462,7 +469,8 @@ final class NovaGovernor {
 
         // 2. Jitter: a wide p95–median gap is a ragged stage tail —
         //    finer raster grain smooths it (more, smaller chunks).
-        if jit > Self.jitterFactor * med, rasterChunkRows > Self.grainMin {
+        if jit > Self.jitterFactor * med, rasterChunkRows > Self.grainMin,
+           tickCount >= grainLockoutUntilTick {
             rasterChunkRows = max(Self.grainMin, rasterChunkRows / 2)
             if !leverStack.contains(.grain) { leverStack.append(.grain) }
             leverWorkBaselineMs = workMedianMs
@@ -473,7 +481,8 @@ final class NovaGovernor {
         // 3. Jitter persisting at minimum grain is contention:
         //    cap the GPU's host width so the CPU, the download
         //    path and the UI stop fighting the stages.
-        if jit > Self.jitterFactor * med, gpuStageWidth == 0 {
+        if jit > Self.jitterFactor * med, gpuStageWidth == 0,
+           tickCount >= widthLockoutUntilTick {
             gpuStageWidth = Self.contentionWidth
             if !leverStack.contains(.width) { leverStack.append(.width) }
             leverWorkBaselineMs = workMedianMs

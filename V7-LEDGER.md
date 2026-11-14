@@ -144,6 +144,40 @@ the ratchet, in one run.
 - Expected: all pre-v7 checksums intact; §13+§14 green; §11
   governed ≈ control in both phases with the pacing state and
   log printed.
+- Measured (CI run 43532204150): bench job green; host-tests
+  1 FAIL (§14 width-guard trace — see attempt 1b). Bench
+  evidence (slow runner; §9 control work mean 23.4 ms):
+  - §10 fast series: governed interval mean 19.05 ms ≈ its
+    own work mean 19.10 — zero pacing tax; final state
+    "disengaged — frames are work-bound", exactly the
+    v7-correct outcome on a back-to-back loop.
+  - §11 slow series: phase A governed 72.3 ms vs control
+    71.4 (FPS 13.83 vs 14.01 — within noise); phase A tail
+    governed 64.5 vs control 71.8; phase B governed 19.7 vs
+    control 13.6 — the governed run's own work ran hotter
+    (19.8 vs 13.6) with grain-2 episodes active in phase B on
+    a drifting runner. The log shows the guard doing its job
+    throughout: pacing engaged @ 12.4 ms ceiling, guard-tripped
+    at tick 32 with the exact "pacing disengaged: it was
+    costing frames" line; grain applied and guard-reverted
+    three times as work rose under it.
+  Status: bench side DONE; one host-test failure → attempt 1b.
+
+## Attempt 1b — guard lockout for reverted levers
+- Convicted by §14's width trace: the guard reverted the
+  width cap, but the jitter rule legitimately re-applied it
+  30 ticks later (jitter conditions unchanged), and the two
+  fought for the rest of the trace — final width depended on
+  phase parity. A guard-convicted lever must stay off.
+- Change: reverting width/grain now also sets a 240-tick
+  lockout for that lever (pacing already had one); rules 2/3
+  check their lockout before applying. Same change damps the
+  apply/revert cycling the attempt-1 bench log showed on a
+  noisy runner (grain applied at #62/#96/#150, reverted at
+  #66/#120/#160 — after 1b the first revert locks it out).
+- Expected: §14 width trace passes (width stays 0 after the
+  revert); §11 phase B governed work no longer carries
+  grain-2 episodes; all other results unchanged.
 - Measured: (pending CI)
 
 ## Attempt 2 — close-out
