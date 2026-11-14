@@ -178,7 +178,34 @@ the ratchet, in one run.
 - Expected: §14 width trace passes (width stays 0 after the
   revert); §11 phase B governed work no longer carries
   grain-2 episodes; all other results unchanged.
-- Measured: (pending CI)
+- Measured (CI run 43532564896, ALL JOBS SUCCESS): §14 width
+  trace passes; host tests **82 PASS, 0 FAIL** (all pre-v7
+  checksums intact; proof fixed 0.02 s vs supervised 0.03 s,
+  full battery green both). §11, same run: phase A governed
+  71.96 ms vs control 71.93 (dead heat), stdev 25.87 vs
+  26.87; phase B governed **16.14 ms / stdev 3.41** vs
+  control 21.07 / 6.91 — where v6's governed phase B was
+  62.79 ms. §11's log shows the whole v7 behaviour in one
+  run: engage @ 19.7 ms ceiling → grain → guard reverts grain
+  (work channel) → guard reverts pacing → width → guard
+  reverts width → lockouts hold ~100 frames. §10: governed
+  interval mean 21.81 = its work mean 21.80 (zero pacing
+  tax), final state work-bound disengaged. Full numbers in
+  BENCH-v7.md.
+- Status: DONE.
 
 ## Attempt 2 — close-out
-- (pending)
+- IPA from the code-final CI run 43532564896:
+  NovaGPU-Test-v7.ipa, 260,410 bytes, md5
+  6844d8b18234e91588ed06b9ec14e5c6, bundle
+  com.user.novagputest. Shipped binary strings-verified to
+  contain the v7 paths (SET_PACING, "costing frames",
+  "work-bound", "pacing disengaged", "Governor pace ceiling",
+  "guard lockout", calibrating state) and NONE of the v6
+  tier machinery (SET_PACE_TIER absent).
+- README v7 section + BENCH-v7.md written; pushes verified
+  by tree; NOVA tracking entry logged.
+- Status: DONE. Device verdict owed from the tester:
+  governor ON should read at least the governor-OFF FPS and
+  steadier — or show pacing disengaged with its reason in
+  the HUD while the FPS matches the off state.

@@ -164,6 +164,62 @@ later (the bus is the compatibility contract for that merge).
   v6 device verdict is the tester's. Full record:
   `BENCH-v6.md`, attempts in `V6-LEDGER.md`.
 
+## v7 — the Governor fix: pacing can never cost frames again
+
+- **The v6 device verdict, plainly:** with the Governor
+  enabled, the Live Scene ran at a stable **19.2 FPS** on the
+  iPad Air M3 — stable, but much slower than the ~35 FPS the
+  scene ran ungoverned. The stability arrived; the speed did
+  not. v7 exists because of that result.
+- **What was wrong (convicted from the code, then reproduced
+  on the host before any fix):** the chip's only frame sensor
+  was the present-to-present interval — a number its own
+  pacing wait inflates. It stepped a fixed tier ladder
+  (16.7 / 20.8 / 25 / 33.3 / 50 ms) off that interval's
+  median, and stepping back up required the median to fall
+  below the next tier × 0.80 — impossible while the pacer
+  itself held every interval at the current tier. A one-way
+  ratchet to 50 ms. The reproduction (bench §11, device-like
+  work pattern) walked the same ladder to 50.0 and stayed
+  there at 15.9 FPS while the identical ungoverned loop ran
+  50.1 FPS.
+- **The never-slower law, as now implemented:**
+  - Work and interval are **separate sensors**. The pace
+    ceiling is the **p25 of recent frame WORK** (device busy
+    time, which no wait can inflate), re-derived every tick.
+    There is no ladder; a ceiling can never sit above speed
+    the hardware has demonstrably achieved.
+  - **Work-limited disengagement:** when the interval *is*
+    the work — the loop has no slack — pacing stays
+    disengaged and the log says why. Stability work falls to
+    the grain / width / priority levers.
+  - **A/B self-guard:** a 24-frame ungoverned probe at enable
+    time measures the loop's baseline slop. Afterwards the
+    chip continuously compares governed throughput against
+    that estimate (and the work median against the snapshot
+    taken when a lever was applied — grain/width costs hide
+    inside the work). Any lever that costs more than ~5%
+    is reverted, the log says so in plain words ("pacing
+    disengaged: it was costing frames"), and a convicted
+    lever stays off for 240 frames.
+- **HUD honesty:** the Live Scene now shows the Governor's
+  pacing state in words (engaged / calibrating / disengaged —
+  and why), the current pace ceiling in ms, and the frame
+  jitter, next to the existing toggles — the chip's behaviour
+  is checkable at a glance, one tap from the A/B.
+- **Host proof (CI, same-run A/B on the device-like series):**
+  phase A governed 71.96 ms vs control 71.93 (a dead heat —
+  pacing out of the way, as designed); phase B governed
+  16.14 ms / stdev 3.41 vs control 21.07 / 6.91, where v6 had
+  stayed locked at 62.79 ms. Host tests 82 PASS / 0 FAIL with
+  every framebuffer checksum byte-identical. The honest
+  summary: at device-like speeds the scene is work-bound, so
+  the shipped governor stabilizes only when there is headroom
+  and otherwise stays out of the way — what it guarantees is
+  the floor, that enabling it can no longer cost frames. The
+  device verdict is the tester's. Full record: `BENCH-v7.md`,
+  attempts in `V7-LEDGER.md`.
+
 ## Layout
 
 - `Sources/NovaGPU/` — the GPU core (shader ISA + executor, the GPU,
